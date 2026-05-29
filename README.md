@@ -2,7 +2,7 @@
 
 Visualize, and causally intervene in, the internal activations of a Stable Diffusion XL U-Net during diffusion.
 
-[Live demo](https://ppeeta.github.io/unet-activation-visualizer/) · [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[Live demo](https://ppikkuaho.github.io/unet-activation-visualizer/) · [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ![Animated 3D view of the SDXL U-Net across the diffusion denoising loop: block brightness tracks activation magnitude and the gold arcs mark the cross-attention blocks while the preview image forms.](docs/denoising.gif)
 
@@ -55,7 +55,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the data schema, the block registry, 
 The visualizer runs entirely in the browser on the committed example data; no Python and no build step are needed. It must be served over HTTP, as the application uses `fetch`, which browsers block on `file://`:
 
 ```bash
-git clone https://github.com/ppeeta/unet-activation-visualizer
+git clone https://github.com/ppikkuaho/unet-activation-visualizer
 cd unet-activation-visualizer
 python3 -m http.server 8000
 # open http://localhost:8000
