@@ -1,0 +1,372 @@
+{
+  "description": "Canonical SDXL UNet block registry. Source of truth for block names, ordering, and metadata.",
+  "model": "SDXL (Stable Diffusion XL) architecture",
+  "total_blocks": 32,
+  "blocks": [
+    {
+      "id": "input_blocks.1.0",
+      "order": 0,
+      "side": "encoder",
+      "level": 1,
+      "type": "ResBlock",
+      "channels": 320,
+      "resolution": [152, 104],
+      "has_cross_attn": false,
+      "label": "IN1.0 ResBlock"
+    },
+    {
+      "id": "input_blocks.2.0",
+      "order": 1,
+      "side": "encoder",
+      "level": 1,
+      "type": "ResBlock",
+      "channels": 320,
+      "resolution": [152, 104],
+      "has_cross_attn": false,
+      "label": "IN2.0 ResBlock"
+    },
+    {
+      "id": "input_blocks.3.0",
+      "order": 2,
+      "side": "encoder",
+      "level": 1,
+      "type": "Downsample",
+      "channels": 320,
+      "resolution": [76, 52],
+      "has_cross_attn": false,
+      "label": "IN3.0 Downsample"
+    },
+    {
+      "id": "input_blocks.4.0",
+      "order": 3,
+      "side": "encoder",
+      "level": 2,
+      "type": "ResBlock",
+      "channels": 640,
+      "resolution": [76, 52],
+      "has_cross_attn": false,
+      "label": "IN4.0 ResBlock"
+    },
+    {
+      "id": "input_blocks.4.1",
+      "order": 4,
+      "side": "encoder",
+      "level": 2,
+      "type": "SpatialTransformer",
+      "channels": 640,
+      "resolution": [76, 52],
+      "has_cross_attn": true,
+      "label": "IN4.1 CrossAttn"
+    },
+    {
+      "id": "input_blocks.5.0",
+      "order": 5,
+      "side": "encoder",
+      "level": 2,
+      "type": "ResBlock",
+      "channels": 640,
+      "resolution": [76, 52],
+      "has_cross_attn": false,
+      "label": "IN5.0 ResBlock"
+    },
+    {
+      "id": "input_blocks.5.1",
+      "order": 6,
+      "side": "encoder",
+      "level": 2,
+      "type": "SpatialTransformer",
+      "channels": 640,
+      "resolution": [76, 52],
+      "has_cross_attn": true,
+      "label": "IN5.1 CrossAttn"
+    },
+    {
+      "id": "input_blocks.6.0",
+      "order": 7,
+      "side": "encoder",
+      "level": 2,
+      "type": "Downsample",
+      "channels": 640,
+      "resolution": [38, 26],
+      "has_cross_attn": false,
+      "label": "IN6.0 Downsample"
+    },
+    {
+      "id": "input_blocks.7.0",
+      "order": 8,
+      "side": "encoder",
+      "level": 3,
+      "type": "ResBlock",
+      "channels": 1280,
+      "resolution": [38, 26],
+      "has_cross_attn": false,
+      "label": "IN7.0 ResBlock"
+    },
+    {
+      "id": "input_blocks.7.1",
+      "order": 9,
+      "side": "encoder",
+      "level": 3,
+      "type": "SpatialTransformer",
+      "channels": 1280,
+      "resolution": [38, 26],
+      "has_cross_attn": true,
+      "label": "IN7.1 CrossAttn"
+    },
+    {
+      "id": "input_blocks.8.0",
+      "order": 10,
+      "side": "encoder",
+      "level": 3,
+      "type": "ResBlock",
+      "channels": 1280,
+      "resolution": [38, 26],
+      "has_cross_attn": false,
+      "label": "IN8.0 ResBlock"
+    },
+    {
+      "id": "input_blocks.8.1",
+      "order": 11,
+      "side": "encoder",
+      "level": 3,
+      "type": "SpatialTransformer",
+      "channels": 1280,
+      "resolution": [38, 26],
+      "has_cross_attn": true,
+      "label": "IN8.1 CrossAttn"
+    },
+    {
+      "id": "middle_block.0",
+      "order": 12,
+      "side": "middle",
+      "level": 3,
+      "type": "ResBlock",
+      "channels": 1280,
+      "resolution": [38, 26],
+      "has_cross_attn": false,
+      "label": "MID0 ResBlock"
+    },
+    {
+      "id": "middle_block.1",
+      "order": 13,
+      "side": "middle",
+      "level": 3,
+      "type": "SpatialTransformer",
+      "channels": 1280,
+      "resolution": [38, 26],
+      "has_cross_attn": true,
+      "label": "MID1 CrossAttn"
+    },
+    {
+      "id": "middle_block.2",
+      "order": 14,
+      "side": "middle",
+      "level": 3,
+      "type": "ResBlock",
+      "channels": 1280,
+      "resolution": [38, 26],
+      "has_cross_attn": false,
+      "label": "MID2 ResBlock"
+    },
+    {
+      "id": "output_blocks.0.0",
+      "order": 15,
+      "side": "decoder",
+      "level": 3,
+      "type": "ResBlock",
+      "channels": 1280,
+      "resolution": [38, 26],
+      "has_cross_attn": false,
+      "label": "OUT0.0 ResBlock"
+    },
+    {
+      "id": "output_blocks.0.1",
+      "order": 16,
+      "side": "decoder",
+      "level": 3,
+      "type": "SpatialTransformer",
+      "channels": 1280,
+      "resolution": [38, 26],
+      "has_cross_attn": true,
+      "label": "OUT0.1 CrossAttn"
+    },
+    {
+      "id": "output_blocks.1.0",
+      "order": 17,
+      "side": "decoder",
+      "level": 3,
+      "type": "ResBlock",
+      "channels": 1280,
+      "resolution": [38, 26],
+      "has_cross_attn": false,
+      "label": "OUT1.0 ResBlock"
+    },
+    {
+      "id": "output_blocks.1.1",
+      "order": 18,
+      "side": "decoder",
+      "level": 3,
+      "type": "SpatialTransformer",
+      "channels": 1280,
+      "resolution": [38, 26],
+      "has_cross_attn": true,
+      "label": "OUT1.1 CrossAttn"
+    },
+    {
+      "id": "output_blocks.2.0",
+      "order": 19,
+      "side": "decoder",
+      "level": 3,
+      "type": "ResBlock",
+      "channels": 1280,
+      "resolution": [38, 26],
+      "has_cross_attn": false,
+      "label": "OUT2.0 ResBlock"
+    },
+    {
+      "id": "output_blocks.2.1",
+      "order": 20,
+      "side": "decoder",
+      "level": 3,
+      "type": "SpatialTransformer",
+      "channels": 1280,
+      "resolution": [38, 26],
+      "has_cross_attn": true,
+      "label": "OUT2.1 CrossAttn"
+    },
+    {
+      "id": "output_blocks.2.2",
+      "order": 21,
+      "side": "decoder",
+      "level": 2,
+      "type": "Upsample",
+      "channels": 1280,
+      "resolution": [76, 52],
+      "has_cross_attn": false,
+      "label": "OUT2.2 Upsample"
+    },
+    {
+      "id": "output_blocks.3.0",
+      "order": 22,
+      "side": "decoder",
+      "level": 2,
+      "type": "ResBlock",
+      "channels": 640,
+      "resolution": [76, 52],
+      "has_cross_attn": false,
+      "label": "OUT3.0 ResBlock"
+    },
+    {
+      "id": "output_blocks.3.1",
+      "order": 23,
+      "side": "decoder",
+      "level": 2,
+      "type": "SpatialTransformer",
+      "channels": 640,
+      "resolution": [76, 52],
+      "has_cross_attn": true,
+      "label": "OUT3.1 CrossAttn"
+    },
+    {
+      "id": "output_blocks.4.0",
+      "order": 24,
+      "side": "decoder",
+      "level": 2,
+      "type": "ResBlock",
+      "channels": 640,
+      "resolution": [76, 52],
+      "has_cross_attn": false,
+      "label": "OUT4.0 ResBlock"
+    },
+    {
+      "id": "output_blocks.4.1",
+      "order": 25,
+      "side": "decoder",
+      "level": 2,
+      "type": "SpatialTransformer",
+      "channels": 640,
+      "resolution": [76, 52],
+      "has_cross_attn": true,
+      "label": "OUT4.1 CrossAttn"
+    },
+    {
+      "id": "output_blocks.5.0",
+      "order": 26,
+      "side": "decoder",
+      "level": 2,
+      "type": "ResBlock",
+      "channels": 640,
+      "resolution": [76, 52],
+      "has_cross_attn": false,
+      "label": "OUT5.0 ResBlock"
+    },
+    {
+      "id": "output_blocks.5.1",
+      "order": 27,
+      "side": "decoder",
+      "level": 2,
+      "type": "SpatialTransformer",
+      "channels": 640,
+      "resolution": [76, 52],
+      "has_cross_attn": true,
+      "label": "OUT5.1 CrossAttn"
+    },
+    {
+      "id": "output_blocks.5.2",
+      "order": 28,
+      "side": "decoder",
+      "level": 1,
+      "type": "Upsample",
+      "channels": 640,
+      "resolution": [152, 104],
+      "has_cross_attn": false,
+      "label": "OUT5.2 Upsample"
+    },
+    {
+      "id": "output_blocks.6.0",
+      "order": 29,
+      "side": "decoder",
+      "level": 1,
+      "type": "ResBlock",
+      "channels": 320,
+      "resolution": [152, 104],
+      "has_cross_attn": false,
+      "label": "OUT6.0 ResBlock"
+    },
+    {
+      "id": "output_blocks.7.0",
+      "order": 30,
+      "side": "decoder",
+      "level": 1,
+      "type": "ResBlock",
+      "channels": 320,
+      "resolution": [152, 104],
+      "has_cross_attn": false,
+      "label": "OUT7.0 ResBlock"
+    },
+    {
+      "id": "output_blocks.8.0",
+      "order": 31,
+      "side": "decoder",
+      "level": 1,
+      "type": "ResBlock",
+      "channels": 320,
+      "resolution": [152, 104],
+      "has_cross_attn": false,
+      "label": "OUT8.0 ResBlock"
+    }
+  ],
+  "viz_aliases": {
+    "input_blocks.0": null,
+    "input_blocks.3": "input_blocks.3.0",
+    "input_blocks.6": "input_blocks.6.0",
+    "output_blocks.6": "output_blocks.6.0",
+    "output_blocks.7": "output_blocks.7.0"
+  },
+  "notes": {
+    "input_blocks.0": "Conv In — not hooked by activation engine (first conv, not TimestepEmbedSequential). No profile data available.",
+    "output_blocks.2.2": "Upsample transition L3→L2. Present in profiles. Viz currently maps this to output_blocks.2.0 position area.",
+    "output_blocks.5.2": "Upsample transition L2→L1. Present in profiles. Viz currently maps this to output_blocks.5.0 position area.",
+    "shape_batch_2": "All shapes show batch=2 because CFG doubles the batch (cond + uncond). Stats capture both together."
+  }
+}

@@ -1,0 +1,21 @@
+SDXL U-Net Activation Visualizer
+Copyright (c) 2026 Pietari Pikkuaho
+
+This product is dual in nature:
+
+1. CODE — the Python capture/preprocessing pipeline (activation-mapping/scripts/)
+   and the index.html visualizer — is licensed under the MIT License (see LICENSE).
+
+2. EXAMPLE DATA — the rendered images (activation-mapping/images/) and the
+   activation-statistic JSON (activation-mapping/profiles/, .../attention/) — is
+   model-derived output, not original code, and is provided for demonstration:
+
+   - Generated locally with an SDXL checkpoint and no LoRA. The visualizer is
+     model-agnostic; any SDXL checkpoint works.
+   - No model weights are included or redistributed in this repository. The JSON
+     contains derived statistics (norms, magnitudes, summaries) only — never weights.
+   - The example data may be reused under CC BY 4.0, with attribution to this repo.
+
+This software bundles third-party components under their own licenses:
+   - Three.js (vendor/three/) — MIT License, Copyright Three.js Authors.
+   - DM Mono (vendor/fonts/) — SIL Open Font License 1.1.

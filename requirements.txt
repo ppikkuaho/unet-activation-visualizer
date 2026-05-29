@@ -1,0 +1,12 @@
+# Runtime dependencies for the activation-capture pipeline (activation-mapping/scripts/).
+#
+# The browser visualizer (index.html) needs NO Python and NO install — just serve the repo
+# folder over HTTP and open it. These deps are only for (optionally) regenerating the data.
+#
+# NOTE: ComfyUI is an EXTERNAL runtime dependency, imported via sys.path (see COMFYUI_DIR in
+# activation_engine.py). It is NOT installable from PyPI — install ComfyUI separately and point
+# the ACTIVATION_CKPT env var at your own SDXL .safetensors checkpoint.
+
+torch>=2.1
+numpy>=1.24
+pillow>=10.0

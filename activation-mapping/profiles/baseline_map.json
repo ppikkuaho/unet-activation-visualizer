@@ -1,0 +1,22 @@
+{
+  "alpaca_standing_s42": {
+    "info": {
+      "char": "alpaca",
+      "pose": "standing",
+      "seed": 42,
+      "prompt": "best quality, highly detailed photograph of an alpaca standing in a grassy mountain meadow, soft natural daylight, sharp focus, depth of field",
+      "negative": "blurry, low quality, lowres, distorted, deformed, bad anatomy, watermark, signature, text, jpeg artifacts, cropped",
+      "char_lora": ""
+    }
+  },
+  "alpaca_portrait_s42": {
+    "info": {
+      "char": "alpaca",
+      "pose": "portrait",
+      "seed": 42,
+      "prompt": "best quality, highly detailed close-up portrait photograph of a fluffy alpaca looking at the camera, shallow depth of field, bokeh background, soft light",
+      "negative": "blurry, low quality, lowres, distorted, deformed, bad anatomy, watermark, signature, text, jpeg artifacts, cropped",
+      "char_lora": ""
+    }
+  }
+}

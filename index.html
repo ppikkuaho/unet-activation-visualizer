@@ -1,0 +1,4504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Interactive 3D visualization of Stable Diffusion XL U-Net activations and cross-attention across the diffusion denoising loop.">
+<title>SDXL U-Net Activation Visualizer</title>
+<style>
+  /* DM Mono, vendored locally so the page works fully offline (no CDN dependency). */
+  @font-face { font-family: 'DM Mono'; font-weight: 300; font-style: normal;
+    src: url('./vendor/fonts/dm-mono-300.woff2') format('woff2'); font-display: swap; }
+  @font-face { font-family: 'DM Mono'; font-weight: 400; font-style: normal;
+    src: url('./vendor/fonts/dm-mono-400.woff2') format('woff2'); font-display: swap; }
+</style>
+<style>
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background: radial-gradient(ellipse at 38% 38%, #dfdeda 0%, #ceccca 60%, #bdbcb9 100%);
+    font-family: 'DM Mono', monospace;
+  }
+  #canvas-container { width: 100%; height: 100%; position: fixed; top: 0; left: 0; z-index: 0; }
+  canvas { display: block; }
+
+  .label {
+    position: fixed; z-index: 10; pointer-events: none;
+    font-family: 'DM Mono', monospace;
+  }
+  .tl {
+    top: 28px; left: 28px;
+    font-size: 9px; font-weight: 300;
+    letter-spacing: 0.3em; text-transform: uppercase;
+    color: rgba(0,0,0,0.35);
+    line-height: 1.8;
+    max-width: 60vw;
+  }
+  .bl {
+    bottom: 28px; left: 28px;
+    font-size: 11px; font-weight: 400;
+    color: rgba(0,0,0,0.25);
+    letter-spacing: 0.08em;
+  }
+  .br {
+    bottom: 28px; right: 28px;
+    display: flex; flex-direction: column; align-items: flex-end; gap: 5px;
+  }
+  .swatch {
+    width: 12px; height: 12px; border-radius: 1px;
+    background: #E8BD73;
+  }
+  .hex {
+    font-size: 8px; font-weight: 300;
+    color: rgba(0,0,0,0.2);
+    letter-spacing: 0.12em;
+  }
+  .legend {
+    bottom: 72px; left: 50%; transform: translateX(-50%);
+    font-size: 8px; font-weight: 300;
+    letter-spacing: 0.18em; text-transform: uppercase;
+    color: rgba(0,0,0,0.3); text-align: center;
+    line-height: 1.9; max-width: 70vw;
+  }
+  .vignette-overlay {
+    position: fixed; inset: 0;
+    pointer-events: none; z-index: 1;
+    background: radial-gradient(ellipse at center, transparent 60%, rgba(0,0,0,0.08) 100%);
+  }
+</style>
+</head>
+<body>
+
+<div class="label tl">U-NET ARCHITECTURE / SDXL</div>
+<div class="label bl">2,567,401,088</div>
+<div class="label br">
+  <div class="swatch"></div>
+  <span class="hex">#E8BD73</span>
+</div>
+<div class="label legend">brightness = activation magnitude &nbsp;·&nbsp; gold arcs = cross-attention blocks (output magnitude)<br>drag to orbit &nbsp;·&nbsp; scroll to zoom &nbsp;·&nbsp; click a block for detail</div>
+
+<div class="vignette-overlay"></div>
+<div id="image-overlay">
+  <span id="image-overlay-close">&times;</span>
+  <img id="overlay-img" alt="Expanded intermediate">
+</div>
+<div id="canvas-container"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three/build/three.module.js",
+    "three/addons/": "./vendor/three/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+// Post-processing removed: bloom caused shimmer on thin skip geometry (same class as SSAO).
+// Native MSAA (antialias: true) is stable and sufficient.
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Configuration
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const FOGColor = 0xceccca;
+
+// Tube radii — 45% thinner than v5 for architectural proportion
+const R = { 1: 0.038, 2: 0.060, 3: 0.088 };
+
+// X offset from center by resolution level
+const LX = { 1: 8.0, 2: 5.5, 3: 3.5 };
+
+// Stretched vertical spacing — doubles aspect ratio for vertebral feel
+const SP = 2.0;
+const TGAP = 2.4;
+
+const R_TIP = 0.038;
+const R_BOTTLENECK = 0.088;
+
+// Geometry detail
+const TUBE_SEGMENTS = 128;
+const RADIAL_SEGMENTS = 10;
+const SKIP_RADIAL = 8;
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Scene
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const container = document.getElementById('canvas-container');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(FOGColor);
+scene.fog = new THREE.FogExp2(FOGColor, 0.006);
+
+const camera = new THREE.PerspectiveCamera(
+  32, window.innerWidth / window.innerHeight, 0.1, 300
+);
+camera.position.set(5, -2, 60);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+renderer.toneMapping = THREE.AgXToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+container.appendChild(renderer.domElement);
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Minimal Environment Map — dark with controlled highlights
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const pmremGenerator = new THREE.PMREMGenerator(renderer);
+pmremGenerator.compileEquirectangularShader();
+
+const envScene = new THREE.Scene();
+const envBg = new THREE.Mesh(
+  new THREE.IcosahedronGeometry(1, 1),
+  new THREE.MeshBasicMaterial({ color: 0xd8d5d0, side: THREE.BackSide })
+);
+envBg.scale.setScalar(20);
+envScene.add(envBg);
+
+// Single subtle highlight panel for controlled anisotropic reflection
+const envPanel = new THREE.Mesh(
+  new THREE.PlaneGeometry(3, 2),
+  new THREE.MeshBasicMaterial({ color: 0xaaaaaa, side: THREE.DoubleSide })
+);
+envPanel.position.set(-5, 8, 8);
+envPanel.lookAt(0, 0, 0);
+envScene.add(envPanel);
+
+const envMap = pmremGenerator.fromScene(envScene, 0.04).texture;
+pmremGenerator.dispose();
+scene.environment = envMap;
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Controls — deliberate, museum-like
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.rotateSpeed = 0.35;
+controls.zoomSpeed = 0.6;
+controls.panSpeed = 0.3;
+controls.minDistance = 8;
+controls.maxDistance = 120;
+controls.target.set(3, -6, 0);
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Lighting — single-source raking gallery light
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Key: raking light from upper-left
+const keyLight = new THREE.DirectionalLight(0xfff0dc, 1.4);
+keyLight.position.set(-12, 10, 16);
+scene.add(keyLight);
+
+// Fill: cool counter
+const fillLight = new THREE.DirectionalLight(0xd0daf0, 0.25);
+fillLight.position.set(10, -4, -8);
+scene.add(fillLight);
+
+// Rim: subtle edge definition
+const rimLight = new THREE.DirectionalLight(0xc8daff, 0.18);
+rimLight.position.set(6, 10, -18);
+scene.add(rimLight);
+
+// Hemisphere: warm sky / cool ground
+const hemiLight = new THREE.HemisphereLight(0xf0ece6, 0xc8d0da, 0.12);
+scene.add(hemiLight);
+
+// Ambient
+scene.add(new THREE.AmbientLight(0xf0edea, 0.08));
+
+// Subtle uplight pool from below
+const uplight = new THREE.PointLight(0xd8dce4, 0.3, 50);
+scene.add(uplight); // positioned after MID_Y computed
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Materials — anisotropic metallic tubes, matte soma, emissive brass skips
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Channel-to-strand mapping: each physical strand represents ~64 channels (= 1 attention head)
+const CH_TO_STRANDS = { 320: 5, 640: 10, 1280: 20 };
+
+// Sub-channel count within each physical strand (for shader texture)
+const SUB_CHANNELS_PER_STRAND = 8;
+
+// Create arm material with sub-channel shader striations
+function createArmMat(color, roughness = 0.40, metalness = 0.65) {
+  return new THREE.MeshPhysicalMaterial({
+    color,
+    roughness,
+    metalness,
+    anisotropy: 0.8,
+    anisotropyRotation: 0,
+    envMapIntensity: 0.30,
+  });
+}
+
+// Per-level materials are now created dynamically per-strand via createStrandMats() in buildLevelTube().
+// Each strand (= 1 attention head) gets its own material for independent head-activation coloring.
+
+// Soma (junction spheres) — matte ceramic, no anisotropy
+// Per-block materials are created individually in the somaMeshes section below.
+
+// Skip connection base material — warm brass, emissive
+// Individual instances created per skip connection for animated emission
+function createSkipMat(phase) {
+  return new THREE.MeshPhysicalMaterial({
+    color: 0xe8bd73,
+    roughness: 0.30,
+    metalness: 0.6,
+    anisotropy: 0.6,
+    anisotropyRotation: 0,
+    envMapIntensity: 0.15,
+    emissive: 0xe8bd73,
+    emissiveIntensity: 0.18,
+  });
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Cable Striation Shader — longitudinal strands hinting at channel structure
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Injects longitudinal striations into MeshPhysicalMaterial tubes.
+// strandMin/strandMax: strand count varies along tube (UV.x = 0→1)
+// intensity: how much darker the valleys between strands are (0.0→1.0)
+function addCableStriations(mat, strandMin, strandMax, intensity = 0.08) {
+  const shaderRef = { value: null }; // store compiled shader for uniform updates
+  mat.defines = mat.defines || {};
+  mat.defines.USE_UV = '';
+  mat.onBeforeCompile = (shader) => {
+    const originalFS = shader.fragmentShader;
+    shaderRef.value = shader;
+    shader.uniforms.u_strandMin = { value: strandMin };
+    shader.uniforms.u_strandMax = { value: strandMax };
+    shader.uniforms.u_strandIntensity = { value: intensity };
+    shader.uniforms.u_progress = { value: -1.0 }; // Phase C: signal flow (inactive = -1)
+    shader.uniforms.u_progressOffset = { value: 0.0 }; // Per-strand timing offset (0→0.15) for wave effect
+    shader.uniforms.u_headActivation = { value: 0.0 }; // Per-head activation intensity (0=inactive)
+    shader.uniforms.u_headColor = { value: new THREE.Color(0.91, 0.74, 0.45) }; // Per-head color (warm default)
+    shader.uniforms.u_blockStart = { value: 0.0 }; // Tube position where current block starts (head color clip)
+    shader.uniforms.u_subStrands = { value: 8.0 }; // Sub-channel count within this strand (GroupNorm groups)
+
+    // Forward UV from vertex → fragment via custom varying
+    shader.vertexShader = shader.vertexShader.replace(
+      'void main() {',
+      'varying vec2 vTubeUv;\nvoid main() {\n  vTubeUv = uv;'
+    );
+
+    shader.fragmentShader = shader.fragmentShader.replace(
+      'void main() {',
+      [
+        'varying vec2 vTubeUv;',
+        'uniform float u_strandMin;',
+        'uniform float u_strandMax;',
+        'uniform float u_strandIntensity;',
+        'uniform float u_progress;',
+        'uniform float u_progressOffset;',
+        'uniform float u_headActivation;',
+        'uniform vec3 u_headColor;',
+        'uniform float u_blockStart;',
+        'uniform float u_subStrands;',
+        'void main() {'
+      ].join('\n')
+    );
+
+    // After color_fragment: modulate diffuseColor with striations + signal flow + head activation
+    shader.fragmentShader = shader.fragmentShader.replace(
+      /\s*#include <color_fragment>/,
+      `\n      #include <color_fragment>
+      // === Primary channel texture (attention head level) ===
+      // vTubeUv.y = around circumference (0→1), vTubeUv.x = along length (0→1)
+      float sc = mix(u_strandMin, u_strandMax, vTubeUv.x);
+      float circumStrand = sin(vTubeUv.y * sc * 6.28318) * 0.5 + 0.5;
+
+      // === Sub-channel detail (GroupNorm groups within each head) ===
+      // Higher-frequency pattern: ~8 micro-strands per tube, visible on zoom
+      float subStrand = sin(vTubeUv.y * u_subStrands * 6.28318) * 0.5 + 0.5;
+      // Longitudinal texture (subtle fiber grain)
+      float lengthGrain = sin(vTubeUv.x * 300.0) * 0.5 + 0.5;
+
+      // Combine: primary strands (60%) + sub-channel detail (25%) + longitudinal grain (15%)
+      float combinedStrand = circumStrand * 0.60 + subStrand * 0.25 + lengthGrain * 0.15;
+      float strandMask = mix(1.0 - u_strandIntensity, 1.0, combinedStrand);
+      diffuseColor.rgb *= strandMask;
+
+      // === Per-strand signal flow with timing offset ===
+      // Each strand's progress is shifted by u_progressOffset, creating a wave cascade.
+      // The signal is a NARROW BRIGHT PULSE traveling along the tube, with a dim
+      // afterglow behind it. This makes the wave cascade between strands visible.
+      float strandProgress = u_progress - u_progressOffset;
+      if (strandProgress > 0.001) {
+        float pos = vTubeUv.x;
+
+        // Per-head activation coloring — only in current block's tube segment
+        // u_blockStart clips the head color to start at the current block boundary
+        if (u_headActivation > 0.0) {
+          float headMask = step(u_blockStart, pos) * step(pos, strandProgress + 0.01);
+          diffuseColor.rgb = mix(diffuseColor.rgb, u_headColor, u_headActivation * 0.6 * headMask);
+        }
+
+        float dist = pos - strandProgress;
+
+        // Narrow traveling pulse (triangular, ±0.10 around the signal front)
+        float pulse = clamp(1.0 - abs(dist) * 10.0, 0.0, 1.0) * 2.4;
+
+        // Afterglow for visited region (behind the front, fades toward tube start)
+        float behindMask = step(pos, strandProgress + 0.01);
+        float trailFade = clamp(pos / max(strandProgress, 0.001), 0.0, 1.0);
+        float trail = behindMask * mix(0.10, 0.35, trailFade);
+
+        float glow = pulse + trail;
+        float headGlowClip = step(u_blockStart, pos) * step(0.001, u_headActivation);
+        vec3 glowColor = mix(vec3(0.91, 0.74, 0.45), u_headColor, headGlowClip);
+        diffuseColor.rgb += glowColor * glow;
+      }
+      `
+    );
+
+    // Position-dependent emissive: only the filled portion of the tube glows.
+    // This replaces the old material-level emissive which lit the WHOLE tube mesh.
+    // Injected after emissivemap_fragment so totalEmissiveRadiance is already initialized.
+    shader.fragmentShader = shader.fragmentShader.replace(
+      /\s*#include <emissivemap_fragment>/,
+      `\n      #include <emissivemap_fragment>
+      // === Position-dependent signal emissive ===
+      // Ambient baseline: dim warm glow so tubes aren't completely flat at rest.
+      totalEmissiveRadiance += vec3(0.04, 0.03, 0.02);
+
+      // Signal glow: only the region BEHIND the signal front gets warm emissive.
+      float spE = u_progress - u_progressOffset;
+      if (spE > 0.001) {
+        float posE = vTubeUv.x;
+        float behindE = step(posE, spE + 0.01);
+        float fadeE = clamp(posE / max(spE, 0.001), 0.0, 1.0);
+        // Narrow bright pulse at signal front + wider trail behind
+        float distE = posE - spE;
+        float pulseE = clamp(1.0 - abs(distE) * 8.0, 0.0, 1.0) * 1.2;
+        float trailE = behindE * mix(0.15, 0.50, fadeE);
+        float emGlow = pulseE + trailE;
+        float headEmClip = step(u_blockStart, posE) * step(0.001, u_headActivation);
+        vec3 emCol = mix(vec3(0.91, 0.74, 0.45), u_headColor, headEmClip);
+        totalEmissiveRadiance += emCol * emGlow;
+      }
+      `
+    );
+    if (shader.fragmentShader === originalFS) {
+      console.warn('[addCableStriations] Shader injection FAILED — #include replacements did not match. Check Three.js version.');
+    }
+  };
+  mat.userData.shaderRef = shaderRef;
+  return mat;
+}
+
+// Striations are now applied per-strand in createStrandMats() during tube construction.
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Block Placement — identical topology, stretched proportions
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const blocks = [];
+const posMap = new Map();
+
+function addBlock(name, label, ch, res, level, side, x, y, isSample = false) {
+  const pos = new THREE.Vector3(x, y, 0);
+  blocks.push({ name, label, ch, res, level, side, pos, isSample });
+  posMap.set(name, pos);
+}
+
+const L1_TOP = 8;
+
+// Encoder L1
+addBlock('input_blocks.0',   'Conv In',             320, '104x152', 1, 'encoder', -LX[1], L1_TOP);
+addBlock('input_blocks.1.0', 'ResBlock + SelfAttn',  320, '104x152', 1, 'encoder', -LX[1], L1_TOP - SP);
+addBlock('input_blocks.2.0', 'ResBlock + SelfAttn',  320, '104x152', 1, 'encoder', -LX[1], L1_TOP - 2*SP);
+
+// Decoder L1
+addBlock('output_blocks.8.0', 'Conv Out',            320, '104x152', 1, 'decoder', LX[1], L1_TOP);
+addBlock('output_blocks.7',   'ResBlock + SelfAttn', 320, '104x152', 1, 'decoder', LX[1], L1_TOP - SP);
+addBlock('output_blocks.6',   'ResBlock + SelfAttn', 320, '104x152', 1, 'decoder', LX[1], L1_TOP - 2*SP);
+addBlock('output_blocks.5.1', 'ResBlock + SelfAttn', 320, '104x152', 1, 'decoder', LX[1], L1_TOP - 3*SP);
+
+// Transition 1->2
+const DS12_Y = L1_TOP - 2*SP - TGAP;
+const US21_Y = L1_TOP - 3*SP - TGAP;
+
+addBlock('input_blocks.3',    'Downsample', 640, '52x76', 1, 'encoder',
+  (-LX[1] + -LX[2]) * 0.5, DS12_Y, true);
+addBlock('output_blocks.5.0', 'Upsample',   320, '104x152', 1, 'decoder',
+  (LX[1] + LX[2]) * 0.5, US21_Y, true);
+
+// Level 2 band
+const L2_TOP = Math.min(DS12_Y, US21_Y) - TGAP * 0.6;
+
+// Encoder L2
+addBlock('input_blocks.4.0', 'ResBlock + CrossAttn', 640, '52x76', 2, 'encoder', -LX[2], L2_TOP);
+addBlock('input_blocks.4.1', 'ResBlock + CrossAttn', 640, '52x76', 2, 'encoder', -LX[2], L2_TOP - SP);
+addBlock('input_blocks.5.0', 'ResBlock + CrossAttn', 640, '52x76', 2, 'encoder', -LX[2], L2_TOP - 2*SP);
+addBlock('input_blocks.5.1', 'ResBlock + CrossAttn', 640, '52x76', 2, 'encoder', -LX[2], L2_TOP - 3*SP);
+
+// Decoder L2
+addBlock('output_blocks.4.1', 'ResBlock + CrossAttn', 640, '52x76', 2, 'decoder', LX[2], L2_TOP);
+addBlock('output_blocks.4.0', 'ResBlock + CrossAttn', 640, '52x76', 2, 'decoder', LX[2], L2_TOP - SP);
+addBlock('output_blocks.3.1', 'ResBlock + CrossAttn', 640, '52x76', 2, 'decoder', LX[2], L2_TOP - 2*SP);
+addBlock('output_blocks.3.0', 'ResBlock + CrossAttn', 640, '52x76', 2, 'decoder', LX[2], L2_TOP - 3*SP);
+addBlock('output_blocks.2.1', 'ResBlock + CrossAttn', 640, '52x76', 2, 'decoder', LX[2], L2_TOP - 4*SP);
+
+// Transition 2->3
+const DS23_Y = L2_TOP - 3*SP - TGAP;
+const US32_Y = L2_TOP - 4*SP - TGAP;
+
+addBlock('input_blocks.6',    'Downsample', 1280, '26x38', 2, 'encoder',
+  (-LX[2] + -LX[3]) * 0.5, DS23_Y, true);
+addBlock('output_blocks.2.0', 'Upsample',    640, '52x76', 2, 'decoder',
+  (LX[2] + LX[3]) * 0.5, US32_Y, true);
+
+// Level 3 band
+const L3_TOP = Math.min(DS23_Y, US32_Y) - TGAP * 0.6;
+
+// Encoder L3
+addBlock('input_blocks.7.0', 'ResBlock + CrossAttn', 1280, '26x38', 3, 'encoder', -LX[3], L3_TOP);
+addBlock('input_blocks.7.1', 'ResBlock + CrossAttn', 1280, '26x38', 3, 'encoder', -LX[3], L3_TOP - SP);
+addBlock('input_blocks.8.0', 'ResBlock + CrossAttn', 1280, '26x38', 3, 'encoder', -LX[3], L3_TOP - 2*SP);
+addBlock('input_blocks.8.1', 'ResBlock + CrossAttn', 1280, '26x38', 3, 'encoder', -LX[3], L3_TOP - 3*SP);
+
+// Decoder L3
+addBlock('output_blocks.1.1', 'ResBlock + CrossAttn', 1280, '26x38', 3, 'decoder', LX[3], L3_TOP);
+addBlock('output_blocks.1.0', 'ResBlock + CrossAttn', 1280, '26x38', 3, 'decoder', LX[3], L3_TOP - SP);
+addBlock('output_blocks.0.1', 'ResBlock + CrossAttn', 1280, '26x38', 3, 'decoder', LX[3], L3_TOP - 2*SP);
+addBlock('output_blocks.0.0', 'ResBlock + CrossAttn', 1280, '26x38', 3, 'decoder', LX[3], L3_TOP - 3*SP);
+
+// Middle
+const MID_Y = L3_TOP - 3*SP - TGAP * 1.2;
+const midSP = 2.0;
+
+addBlock('middle_block.0', 'ResBlock',  1280, '26x38', 3, 'middle', -midSP, MID_Y);
+addBlock('middle_block.1', 'CrossAttn', 1280, '26x38', 3, 'middle', 0,      MID_Y);
+addBlock('middle_block.2', 'ResBlock',  1280, '26x38', 3, 'middle', midSP,   MID_Y);
+
+// Position the uplight below the structure
+uplight.position.set(0, MID_Y - 8, 5);
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Sequential flow order
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const encoderSeq = [
+  'input_blocks.0', 'input_blocks.1.0', 'input_blocks.2.0',
+  'input_blocks.3',
+  'input_blocks.4.0', 'input_blocks.4.1', 'input_blocks.5.0', 'input_blocks.5.1',
+  'input_blocks.6',
+  'input_blocks.7.0', 'input_blocks.7.1', 'input_blocks.8.0', 'input_blocks.8.1',
+];
+
+const middleSeq = ['middle_block.0', 'middle_block.1', 'middle_block.2'];
+
+const decoderSeq = [
+  'output_blocks.0.0', 'output_blocks.0.1', 'output_blocks.1.0', 'output_blocks.1.1',
+  'output_blocks.2.0',
+  'output_blocks.2.1', 'output_blocks.3.0', 'output_blocks.3.1', 'output_blocks.4.0', 'output_blocks.4.1',
+  'output_blocks.5.0',
+  'output_blocks.5.1', 'output_blocks.6', 'output_blocks.7', 'output_blocks.8.0',
+];
+
+// Full signal flow sequence: encoder → middle → decoder
+const fullSequence = [...encoderSeq, ...middleSeq, ...decoderSeq];
+
+// Replay state
+let activeBlockIndex = -1;  // -1 = no replay active, 0..fullSequence.length-1 = active block
+let isPlaying = false;
+let playSpeed = 3.0;        // blocks per second
+let playMode = 'block';     // 'block' = within-step, 'step' = across steps
+let lastPlayTime = 0;
+
+// Expose replay state for debugging
+Object.defineProperty(window, 'debugReplay', { get: () => ({
+  activeBlockIndex, isPlaying, playSpeed, blockTransition,
+  activeBlock: fullSequence[activeBlockIndex],
+  blockInfo: blockLevelMap.get(fullSequence[activeBlockIndex]),
+}) });
+
+// Debug setter: manually position signal at a specific block + transition
+window.debugSetBlock = (blockIdx, transition = 0.5) => {
+  isPlaying = false;
+  setReplayCursor(blockIdx, transition);
+  updateBlockSlider();
+  return { activeBlockIndex, block: fullSequence[activeBlockIndex], blockTransition };
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Tapered Tube Geometry with Tangent Attribute
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function createTaperedTube(curve, segments, radiusFn, radialSegments) {
+  const frames = curve.computeFrenetFrames(segments, false);
+  const vertices = [];
+  const normals = [];
+  const tangentData = [];
+  const uvs = [];
+  const indices = [];
+
+  for (let i = 0; i <= segments; i++) {
+    const t = i / segments;
+    const position = curve.getPointAt(t);
+    const radius = radiusFn(t);
+    const N = frames.normals[i];
+    const B = frames.binormals[i];
+    const T = frames.tangents[i];
+
+    for (let j = 0; j <= radialSegments; j++) {
+      const v = (j / radialSegments) * Math.PI * 2;
+      const sin = Math.sin(v);
+      const cos = -Math.cos(v);
+      const nx = cos * N.x + sin * B.x;
+      const ny = cos * N.y + sin * B.y;
+      const nz = cos * N.z + sin * B.z;
+      normals.push(nx, ny, nz);
+      vertices.push(
+        position.x + radius * nx,
+        position.y + radius * ny,
+        position.z + radius * nz
+      );
+      tangentData.push(T.x, T.y, T.z, 1.0);
+      uvs.push(t, j / radialSegments);
+    }
+  }
+
+  for (let i = 0; i < segments; i++) {
+    for (let j = 0; j < radialSegments; j++) {
+      const a = i * (radialSegments + 1) + j;
+      const b = (i + 1) * (radialSegments + 1) + j;
+      const c = (i + 1) * (radialSegments + 1) + (j + 1);
+      const d = i * (radialSegments + 1) + (j + 1);
+      indices.push(a, b, d, b, c, d);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setIndex(indices);
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geo.setAttribute('tangent', new THREE.Float32BufferAttribute(tangentData, 4));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  return geo;
+}
+
+function smoothstep(t) {
+  const x = Math.max(0, Math.min(1, t));
+  return x * x * (3 - 2 * x);
+}
+
+/**
+ * Create a bundle of N thinner tubes arranged around a central curve.
+ * Visually represents multiple channels flowing through the connection.
+ *
+ * @param {THREE.CatmullRomCurve3} curve - Central curve of the bundle
+ * @param {number} segments - Longitudinal segments per strand
+ * @param {Function} radiusFn - Bundle radius function f(t) → radius
+ * @param {number} numStrands - Number of strands in the bundle
+ * @param {number} radialSegments - Radial segments per strand cross-section
+ * @returns {THREE.BufferGeometry[]} Array of strand geometries
+ */
+function createCableBundle(curve, segments, radiusFn, numStrands, radialSegments) {
+  const frames = curve.computeFrenetFrames(segments, false);
+  const geometries = [];
+
+  for (let s = 0; s < numStrands; s++) {
+    const angle = (s / numStrands) * Math.PI * 2;
+    const cosA = Math.cos(angle);
+    const sinA = Math.sin(angle);
+
+    // Strand spacing: strands spread wide enough to be clearly separate cables.
+    // Ring radius dynamic along tube: tighter at nodes (t=0,1), wider between them.
+    // This gives the bundle a "breathing" organic look and maximizes visibility.
+    const MIN_STRAND_R = 0.008;
+    const GAP_RATIO = 0.6; // 60% gap between strands
+    const rawStrandR = Math.max(MIN_STRAND_R, radiusFn(0.5) * 0.22);
+    const baseRing = numStrands * rawStrandR * (2 + GAP_RATIO) / (2 * Math.PI);
+    const strandRadiusScale = rawStrandR / Math.max(0.001, radiusFn(0.5));
+
+    const offsetPoints = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+      const basePos = curve.getPointAt(t);
+      const N = frames.normals[i];
+      const B = frames.binormals[i];
+
+      // Dynamic ring radius: 1.0× at endpoints, 1.6× at midpoints between nodes
+      // Creates a visible "bulge" where strands spread apart between blocks
+      const bulge = 1.0 + 0.6 * Math.sin(t * Math.PI);
+      const offsetR = baseRing * bulge;
+
+      offsetPoints.push(new THREE.Vector3(
+        basePos.x + offsetR * (cosA * N.x + sinA * B.x),
+        basePos.y + offsetR * (cosA * N.y + sinA * B.y),
+        basePos.z + offsetR * (cosA * N.z + sinA * B.z)
+      ));
+    }
+
+    const strandCurve = new THREE.CatmullRomCurve3(offsetPoints, false, 'centripetal');
+    const strandRadiusFn = (t) => radiusFn(t) * strandRadiusScale;
+    geometries.push(createTaperedTube(strandCurve, segments, strandRadiusFn, radialSegments));
+  }
+
+  return geometries;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Deterministic pseudo-random
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function hashStr(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h * 16777619) >>> 0;
+  }
+  return h;
+}
+
+function seededOffset(seed, idx) {
+  const h = hashStr(seed + '_' + idx);
+  return ((h & 0xFFFF) / 0xFFFF) * 2 - 1;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Geometry Group
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const group = new THREE.Group();
+scene.add(group);
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Spline Construction
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function insertJitterPoints(blockNames) {
+  const rawPoints = blockNames.map(name => posMap.get(name).clone());
+  const jittered = [rawPoints[0]];
+  for (let i = 0; i < rawPoints.length - 1; i++) {
+    const a = rawPoints[i];
+    const b = rawPoints[i + 1];
+    const seed = blockNames[i] + '_jit_' + blockNames[i + 1];
+    const mid = new THREE.Vector3(
+      (a.x + b.x) * 0.5 + seededOffset(seed, 0) * 0.03,
+      (a.y + b.y) * 0.5,
+      (a.z + b.z) * 0.5 + seededOffset(seed, 2) * 0.04
+    );
+    jittered.push(mid);
+    jittered.push(b);
+  }
+  return jittered;
+}
+
+const encoderJittered = insertJitterPoints(encoderSeq);
+const encTipExtension = posMap.get(encoderSeq[0]).clone().add(new THREE.Vector3(0, R[1] * 4.0, 0));
+const encoderPoints = [encTipExtension, ...encoderJittered];
+
+const decoderJittered = insertJitterPoints(decoderSeq);
+const decTipExtension = posMap.get(decoderSeq[decoderSeq.length - 1]).clone().add(new THREE.Vector3(0, R[1] * 4.0, 0));
+const decoderPoints = [...decoderJittered, decTipExtension];
+
+const middlePoints = middleSeq.map(name => posMap.get(name).clone());
+
+const encoderCurve = new THREE.CatmullRomCurve3(encoderPoints, false, 'centripetal');
+const decoderCurve = new THREE.CatmullRomCurve3(decoderPoints, false, 'centripetal');
+const middleCurve = new THREE.CatmullRomCurve3(middlePoints, false, 'centripetal');
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Radius functions
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const encTipFraction = 1.0 / (encoderPoints.length - 1);
+
+function encoderRadiusFn(t) {
+  if (t < encTipFraction) {
+    return 0.005 + (R_TIP - 0.005) * smoothstep(t / encTipFraction);
+  }
+  const bodyT = (t - encTipFraction) / (1.0 - encTipFraction);
+  return R_TIP + (R_BOTTLENECK - R_TIP) * smoothstep(bodyT);
+}
+
+const decTipFraction = 1.0 / (decoderPoints.length - 1);
+
+function decoderRadiusFn(t) {
+  const tipStart = 1.0 - decTipFraction;
+  if (t > tipStart) {
+    return R_TIP + (0.005 - R_TIP) * smoothstep((t - tipStart) / decTipFraction);
+  }
+  const bodyT = t / tipStart;
+  return R_BOTTLENECK + (R_TIP - R_BOTTLENECK) * smoothstep(bodyT);
+}
+
+function middleRadiusFn() { return R_BOTTLENECK; }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Per-Level Tube Architecture — strand count matches attention heads
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Level strand counts (= attention heads: channels / head_dim, head_dim=64)
+const LEVEL_STRANDS = { 1: 5, 2: 10, 3: 20 };
+const STRAND_RADIAL = 6;
+
+// Per-level block sequences for tube construction
+// Encoder: signal flows L1 → L2 → L3
+const encL1Blocks = ['input_blocks.0', 'input_blocks.1.0', 'input_blocks.2.0'];
+const encL2Blocks = ['input_blocks.3', 'input_blocks.4.0', 'input_blocks.4.1', 'input_blocks.5.0', 'input_blocks.5.1'];
+const encL3Blocks = ['input_blocks.6', 'input_blocks.7.0', 'input_blocks.7.1', 'input_blocks.8.0', 'input_blocks.8.1'];
+// Decoder: signal flows L3 → L2 → L1
+const decL3Blocks = ['output_blocks.0.0', 'output_blocks.0.1', 'output_blocks.1.0', 'output_blocks.1.1'];
+const decL2Blocks = ['output_blocks.2.0', 'output_blocks.2.1', 'output_blocks.3.0', 'output_blocks.3.1', 'output_blocks.4.0', 'output_blocks.4.1'];
+const decL1Blocks = ['output_blocks.5.0', 'output_blocks.5.1', 'output_blocks.6', 'output_blocks.7', 'output_blocks.8.0'];
+
+// Level processing order for signal flow
+const levelOrder = ['encL1', 'encL2', 'encL3', 'middle', 'decL3', 'decL2', 'decL1'];
+
+// Block-to-level mapping (populated during tube construction)
+const blockLevelMap = new Map();
+
+// Per-level tube storage: { meshes: Mesh[], mats: Material[], strands: number, level: number }
+const levelTubes = {};
+
+// Debug exposure — updated after construction (see below transitionTubes)
+window.debugViz = {};
+
+// Create per-strand materials for a level segment
+// level: 1/2/3 — determines sub-channel count (GroupNorm groups per head)
+// SDXL GroupNorm: always 32 groups. Sub-strands per head = 32 / numHeads
+//   L1: 32/5 ≈ 6, L2: 32/10 ≈ 3, L3: 32/20 ≈ 2
+// We use visual multiplier for readable detail: actual × 2
+const LEVEL_SUB_STRANDS = { 1: 12, 2: 6, 3: 4 };
+
+function createStrandMats(baseColor, numStrands, intensity = 0.30, level = 2) {
+  const mats = [];
+  const subStrands = LEVEL_SUB_STRANDS[level] || 8;
+  for (let i = 0; i < numStrands; i++) {
+    const mat = createArmMat(baseColor);
+    addCableStriations(mat, numStrands, numStrands, intensity);
+    // Set sub-channel count after shader compilation
+    const origOnBeforeCompile = mat.onBeforeCompile;
+    mat.onBeforeCompile = (shader, renderer) => {
+      origOnBeforeCompile(shader, renderer);
+      shader.uniforms.u_subStrands.value = subStrands;
+    };
+    mats.push(mat);
+  }
+  return mats;
+}
+
+// Build a per-level tube bundle
+function buildLevelTube(key, blockNames, numStrands, baseColor, tipExtStart, tipExtEnd, intensity = 0.30, level = 2) {
+  // Register blocks in level map
+  blockNames.forEach((name, i) => {
+    blockLevelMap.set(name, { levelKey: key, localIndex: i, localTotal: blockNames.length });
+  });
+
+  // Create per-strand materials (pass level for sub-channel count)
+  const mats = createStrandMats(baseColor, numStrands, intensity, level);
+
+  // Build curve points with jitter
+  const points = [];
+  if (tipExtStart) points.push(tipExtStart);
+  const jittered = insertJitterPoints(blockNames);
+  points.push(...jittered);
+  if (tipExtEnd) points.push(tipExtEnd);
+
+  const curve = new THREE.CatmullRomCurve3(points, false, 'centripetal');
+
+  // Level radius (constant within level)
+  const block = blocks.find(b => b.name === blockNames[0]);
+  const levelR = R[block?.level] || R[2];
+
+  // Radius function: constant for body, with taper at tips
+  let radiusFn;
+  if (tipExtStart) {
+    const tipFrac = 1.0 / (points.length - 1);
+    radiusFn = (t) => {
+      if (t < tipFrac) return 0.005 + (levelR - 0.005) * smoothstep(t / tipFrac);
+      return levelR;
+    };
+  } else if (tipExtEnd) {
+    const tipFrac = 1.0 / (points.length - 1);
+    radiusFn = (t) => {
+      if (t > 1.0 - tipFrac) return levelR + (0.005 - levelR) * smoothstep((t - (1.0 - tipFrac)) / tipFrac);
+      return levelR;
+    };
+  } else {
+    radiusFn = () => levelR;
+  }
+
+  // Create cable bundle
+  const segments = Math.max(36, blockNames.length * 16);
+  const geos = createCableBundle(curve, segments, radiusFn, numStrands, STRAND_RADIAL);
+
+  const meshes = [];
+  geos.forEach((geo, i) => {
+    const mesh = new THREE.Mesh(geo, mats[i]);
+    meshes.push(mesh);
+    group.add(mesh);
+  });
+
+  levelTubes[key] = { meshes, mats, strands: numStrands, level: block?.level || 3 };
+  return { curve, meshes, mats };
+}
+
+// Build transition tube between levels (short connecting segment)
+function buildTransitionTube(fromBlock, toBlock, numStrands, baseColor) {
+  const p1 = posMap.get(fromBlock);
+  const p2 = posMap.get(toBlock);
+  if (!p1 || !p2) return [];
+
+  const ctrl = new THREE.Vector3(
+    (p1.x + p2.x) * 0.5,
+    Math.min(p1.y, p2.y) - 0.8,
+    0
+  );
+  const curve = new THREE.CatmullRomCurve3([p1.clone(), ctrl, p2.clone()], false, 'centripetal');
+
+  // Use destination level's radius
+  const block = blocks.find(b => b.name === toBlock);
+  const levelR = R[block?.level] || R[2];
+
+  const mats = createStrandMats(baseColor, numStrands, 0.25);
+  const geos = createCableBundle(curve, 36, () => levelR, numStrands, STRAND_RADIAL);
+
+  const meshes = [];
+  geos.forEach((geo, i) => {
+    const mesh = new THREE.Mesh(geo, mats[i]);
+    meshes.push(mesh);
+    group.add(mesh);
+  });
+
+  return { meshes, mats };
+}
+
+// ── Encoder Level Tubes ──
+const encTipExt = posMap.get(encL1Blocks[0]).clone().add(new THREE.Vector3(0, R[1] * 4.0, 0));
+buildLevelTube('encL1', encL1Blocks, 5, 0x586070, encTipExt, null, 0.30, 1);
+
+const encL1L2Trans = buildTransitionTube('input_blocks.2.0', 'input_blocks.3', 10, 0x586070);
+buildLevelTube('encL2', encL2Blocks, 10, 0x586070, null, null, 0.30, 2);
+
+const encL2L3Trans = buildTransitionTube('input_blocks.5.1', 'input_blocks.6', 20, 0x586070);
+buildLevelTube('encL3', encL3Blocks, 20, 0x586070, null, null, 0.30, 3);
+
+// ── Middle Tube ──
+// Register middle blocks in level map
+middleSeq.forEach((name, i) => {
+  blockLevelMap.set(name, { levelKey: 'middle', localIndex: i, localTotal: middleSeq.length });
+});
+{
+  const midMats = createStrandMats(0x4a5260, 20, 0.25, 3);
+  const geos = createCableBundle(middleCurve, 36, middleRadiusFn, 20, STRAND_RADIAL);
+  const meshes = [];
+  geos.forEach((geo, i) => {
+    const mesh = new THREE.Mesh(geo, midMats[i]);
+    meshes.push(mesh);
+    group.add(mesh);
+  });
+  levelTubes.middle = { meshes, mats: midMats, strands: 20, level: 3 };
+}
+
+// ── Decoder Level Tubes ──
+buildLevelTube('decL3', decL3Blocks, 20, 0x607068, null, null, 0.30, 3);
+
+const decL3L2Trans = buildTransitionTube('output_blocks.1.1', 'output_blocks.2.0', 10, 0x607068);
+buildLevelTube('decL2', decL2Blocks, 10, 0x607068, null, null, 0.30, 2);
+
+const decL2L1Trans = buildTransitionTube('output_blocks.4.1', 'output_blocks.5.0', 5, 0x607068);
+const decTipExt = posMap.get(decL1Blocks[decL1Blocks.length - 1]).clone().add(new THREE.Vector3(0, R[1] * 4.0, 0));
+buildLevelTube('decL1', decL1Blocks, 5, 0x607068, null, decTipExt, 0.30, 1);
+
+// ── Encoder↔Middle↔Decoder Connections ──
+const encToMidTrans = buildTransitionTube('input_blocks.8.1', 'middle_block.0', 20, 0x4a5260);
+const midToDecTrans = buildTransitionTube('middle_block.2', 'output_blocks.0.0', 20, 0x4a5260);
+
+// Collect all transition tube materials for signal flow control
+const transitionTubes = [
+  { key: 'encL1→encL2', ...encL1L2Trans, afterLevel: 'encL1' },
+  { key: 'encL2→encL3', ...encL2L3Trans, afterLevel: 'encL2' },
+  { key: 'encL3→middle', ...encToMidTrans, afterLevel: 'encL3' },
+  { key: 'middle→decL3', ...midToDecTrans, afterLevel: 'middle' },
+  { key: 'decL3→decL2', ...decL3L2Trans, afterLevel: 'decL3' },
+  { key: 'decL2→decL1', ...decL2L1Trans, afterLevel: 'decL2' },
+];
+
+// Debug exposure for console inspection of shader state
+window.debugViz = { levelTubes, transitionTubes, blockLevelMap, levelOrder };
+
+// Pre-build levelKey → ordered block names map (for head activation caching on preceding levels)
+const levelBlockNames = {};
+fullSequence.forEach(name => {
+  const info = blockLevelMap.get(name);
+  if (!info) return;
+  if (!levelBlockNames[info.levelKey]) levelBlockNames[info.levelKey] = [];
+  levelBlockNames[info.levelKey].push(name);
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Junction Soma Spheres — matte ceramic, no anisotropy
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const somaMeshes = new Map();
+blocks.forEach(block => {
+  const r = (R[block.level] || R[2]) * 3.0;
+  const geo = new THREE.SphereGeometry(r, 12, 10);
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x505868,
+    roughness: 0.80,
+    metalness: 0.05,
+    envMapIntensity: 0.12,
+    emissive: 0x000000,
+    emissiveIntensity: 0.0,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.copy(block.pos);
+  somaMeshes.set(block.name, mesh);
+  group.add(mesh);
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Skip Connections — thin brass wire, emissive, animated
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const skipPairs = [
+  { enc: 'input_blocks.8.1', dec: 'output_blocks.0.0', level: 3 },
+  { enc: 'input_blocks.8.0', dec: 'output_blocks.0.1', level: 3 },
+  { enc: 'input_blocks.7.1', dec: 'output_blocks.1.0', level: 3 },
+  { enc: 'input_blocks.7.0', dec: 'output_blocks.1.1', level: 3 },
+  { enc: 'input_blocks.5.1', dec: 'output_blocks.2.1', level: 2 },
+  { enc: 'input_blocks.5.0', dec: 'output_blocks.3.0', level: 2 },
+  { enc: 'input_blocks.4.1', dec: 'output_blocks.3.1', level: 2 },
+  { enc: 'input_blocks.4.0', dec: 'output_blocks.4.1', level: 2 },
+  { enc: 'input_blocks.6',   dec: 'output_blocks.2.0', level: 2 },  // Downsample→Upsample L2↔L3
+  { enc: 'input_blocks.3',   dec: 'output_blocks.5.0', level: 1 },  // Downsample→Upsample L1↔L2
+  { enc: 'input_blocks.2.0', dec: 'output_blocks.5.1', level: 1 },
+  { enc: 'input_blocks.1.0', dec: 'output_blocks.6',   level: 1 },
+  { enc: 'input_blocks.0',   dec: 'output_blocks.7',   level: 1 },
+];
+
+const skipMeshes = [];
+const skipMats = [];
+
+skipPairs.forEach(({ enc, dec, level }, idx) => {
+  const p1 = posMap.get(enc);
+  const p2 = posMap.get(dec);
+  if (!p1 || !p2) return;
+
+  // Skip radius = 0.3x main tube radius
+  const branchR = R[level];
+  const skipR = Math.max(0.018, branchR * 0.30);
+  const seed = enc + '_skip_' + dec;
+
+  const zFwd = 0.8 + (3 - level) * 0.5 + idx * 0.05;
+  const span = Math.abs(p2.x - p1.x);
+  const sag = -(0.06 + seededOffset(seed, 7) * 0.03) * span;
+
+  const ctrl = new THREE.Vector3(
+    (p1.x + p2.x) * 0.5 + seededOffset(seed, 4) * 0.25,
+    (p1.y + p2.y) * 0.5 + sag + seededOffset(seed, 5) * 0.15,
+    Math.max(p1.z, p2.z) + zFwd
+  );
+
+  const curve = new THREE.QuadraticBezierCurve3(p1.clone(), ctrl, p2.clone());
+
+  const skipRadiusFn = (t) => {
+    // Taper to zero at both ends — tube emerges from/merges into block spheres cleanly
+    return skipR * Math.sin(t * Math.PI);
+  };
+
+  const geo = createTaperedTube(curve, 48, skipRadiusFn, SKIP_RADIAL);
+  const mat = createSkipMat(idx);
+  skipMats.push(mat);
+  const mesh = new THREE.Mesh(geo, mat);
+  skipMeshes.push(mesh);
+  group.add(mesh);
+});
+
+// Build decoder→skip lookup for replay activation
+const skipByDecoder = new Map();
+skipPairs.forEach(({ enc, dec }, idx) => {
+  skipByDecoder.set(dec, { mat: skipMats[idx], meshIdx: idx, enc });
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Spatial Anchoring — section labels, resolution labels, brackets, ground
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function textSprite(text, fontSize = 44, color = '#5a5854', opacity = 0.45) {
+  const c = document.createElement('canvas');
+  const ctx = c.getContext('2d');
+  c.width = 512; c.height = 96;
+  ctx.font = `400 ${fontSize}px "DM Mono", monospace`;
+  ctx.fillStyle = color;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, 256, 48);
+  const tex = new THREE.CanvasTexture(c);
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, opacity, depthTest: true, depthWrite: false });
+  const s = new THREE.Sprite(mat);
+  s.scale.set(4.5, 0.85, 1);
+  return s;
+}
+
+// Section labels
+const encLbl = textSprite('ENCODER', 40);
+encLbl.position.set(-LX[1], L1_TOP + 2.0, 0);
+scene.add(encLbl);
+
+const midLbl = textSprite('MIDDLE', 40);
+midLbl.position.set(0, MID_Y - 2.2, 0);
+scene.add(midLbl);
+
+const decLbl = textSprite('DECODER', 40);
+decLbl.position.set(LX[1], L1_TOP + 2.0, 0);
+scene.add(decLbl);
+
+// Resolution labels
+function resLabel(text, y) {
+  const s = textSprite(text, 28, '#8a857f', 0.30);
+  s.position.set(-LX[1] - 4.0, y, 0);
+  s.scale.set(5.5, 0.7, 1);
+  scene.add(s);
+}
+resLabel('320ch \u00b7 104\u00d7152', L1_TOP - SP);
+resLabel('640ch \u00b7 52\u00d776', L2_TOP - 1.5*SP);
+resLabel('1280ch \u00b7 26\u00d738', L3_TOP - 1.5*SP);
+
+// Level bracket lines
+function addLevelBracket(yTop, yBot) {
+  const pts = [
+    new THREE.Vector3(-LX[1] - 1.8, yTop + 0.6, -0.5),
+    new THREE.Vector3(-LX[1] - 1.8, yBot - 0.6, -0.5),
+  ];
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat = new THREE.LineBasicMaterial({ color: 0xb0aca6, transparent: true, opacity: 0.12 });
+  scene.add(new THREE.Line(geo, mat));
+}
+addLevelBracket(L1_TOP, L1_TOP - 2*SP);
+addLevelBracket(L2_TOP, L2_TOP - 3*SP);
+addLevelBracket(L3_TOP, L3_TOP - 3*SP);
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Ground plane
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const FLOOR_Y = MID_Y - 8;
+
+const gnd = new THREE.Mesh(
+  new THREE.PlaneGeometry(110, 110),
+  new THREE.MeshStandardMaterial({
+    color: 0xbfbbb5, roughness: 0.85, metalness: 0.02,
+    transparent: true, opacity: 0.15,
+  })
+);
+gnd.rotation.x = -Math.PI / 2;
+gnd.position.y = FLOOR_Y;
+scene.add(gnd);
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Cross-Attention Indicators — connections from blocks to prompt field
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Blocks with cross-attention (from registry has_cross_attn: true)
+const CROSS_ATTN_BLOCKS = [
+  'input_blocks.4.1', 'input_blocks.5.1', 'input_blocks.7.1', 'input_blocks.8.1',
+  'middle_block.1',
+  'output_blocks.0.1', 'output_blocks.1.1', 'output_blocks.2.1',
+  'output_blocks.3.1', 'output_blocks.4.1', 'output_blocks.5.1',
+];
+
+// Prompt field — positioned to the right of the structure
+const PROMPT_FIELD_X = LX[1] + 6;
+const PROMPT_FIELD_Y_TOP = L1_TOP;
+const PROMPT_FIELD_Y_BOT = MID_Y;
+
+// Prompt field label
+const promptLbl = textSprite('PROMPT FIELD', 32, '#8a7a60', 0.6);
+promptLbl.position.set(PROMPT_FIELD_X, PROMPT_FIELD_Y_TOP + 2.0, 0);
+promptLbl.scale.set(5.0, 0.7, 1);
+scene.add(promptLbl);
+
+// Vertical prompt field line (material exposed for replay glow)
+const promptFieldMat = new THREE.LineBasicMaterial({ color: 0xc8a868, transparent: true, opacity: 0.35, depthTest: false });
+{
+  const pts = [
+    new THREE.Vector3(PROMPT_FIELD_X, PROMPT_FIELD_Y_TOP + 0.5, 0),
+    new THREE.Vector3(PROMPT_FIELD_X, PROMPT_FIELD_Y_BOT - 0.5, 0),
+  ];
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  scene.add(new THREE.Line(geo, promptFieldMat));
+}
+
+// Cross-attention connection lines (block → prompt field)
+const attnLines = new Map(); // vizName → { line, material }
+
+CROSS_ATTN_BLOCKS.forEach(blockName => {
+  const blockPos = posMap.get(blockName);
+  if (!blockPos) return;
+
+  // Target point on prompt field at same Y as block
+  const targetPos = new THREE.Vector3(PROMPT_FIELD_X, blockPos.y, 0);
+
+  // Curve with slight arc forward (z) for visual separation
+  const midPoint = new THREE.Vector3(
+    (blockPos.x + PROMPT_FIELD_X) * 0.5 + 1.0,
+    (blockPos.y + targetPos.y) * 0.5,
+    1.5  // forward arc
+  );
+
+  const curve = new THREE.QuadraticBezierCurve3(blockPos.clone(), midPoint, targetPos);
+
+  // Use TubeGeometry for visible thickness (LineBasicMaterial.linewidth is clamped to 1px on most GPUs)
+  const tubeGeo = new THREE.TubeGeometry(curve, 24, 0.04, 6, false);
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0xe8bd73,
+    transparent: true,
+    opacity: 0.0,  // start hidden, updated by data
+    depthTest: false,
+    side: THREE.DoubleSide,
+  });
+
+  const mesh = new THREE.Mesh(tubeGeo, mat);
+  mesh.renderOrder = 999;  // render on top
+  scene.add(mesh);
+  attnLines.set(blockName, { line: mesh, material: mat });
+});
+
+function updateCrossAttention() {
+  // Drive the cross-attention arcs from each SpatialTransformer block's OUTPUT MAGNITUDE
+  // (output_norm) at this timestep. Brighter arc = larger output-feature magnitude at that
+  // attention-bearing block (residual included — a coarse activity proxy, not isolated
+  // cross-attention, and not a per-token attention-weight map).
+  const attnTs = currentVizData?.attn_summaries?.[currentTimestep];
+
+  // No data for this timestep: hide the arcs and prompt field, and reset any replay-flash color.
+  if (!attnTs) {
+    attnLines.forEach(({ material }) => {
+      material.opacity = 0.0;
+      material.color.setHex(0xe8bd73);
+    });
+    promptFieldMat.opacity = 0.0;
+    promptLbl.material.opacity = 0.0;
+    return;
+  }
+
+  // Collect output_norm across the cross-attention blocks present this timestep.
+  const norms = [];
+  attnLines.forEach((_entry, blockName) => {
+    const n = attnTs[blockName]?.output_norm;
+    if (typeof n === 'number' && isFinite(n)) norms.push(n);
+  });
+  const minN = norms.length ? Math.min(...norms) : 0;
+  const maxN = norms.length ? Math.max(...norms) : 1;
+  const range = maxN - minN;
+
+  // Map each block's magnitude to arc opacity (min-max normalized per timestep).
+  const OP_MIN = 0.22, OP_MAX = 0.9;
+  attnLines.forEach(({ material }, blockName) => {
+    const n = attnTs[blockName]?.output_norm;
+    material.color.setHex(0xe8bd73); // reset any replay-flash color
+    if (typeof n !== 'number' || !isFinite(n)) {
+      material.opacity = OP_MIN;
+      return;
+    }
+    const t = range > 0 ? (n - minN) / range : 0.5;
+    material.opacity = OP_MIN + t * (OP_MAX - OP_MIN);
+  });
+
+  // Keep the prompt field line + label persistently visible whenever data is loaded.
+  promptFieldMat.opacity = 0.35;
+  promptFieldMat.color.setHex(0xc8a868); // reset replay-flash color
+  promptLbl.material.opacity = 0.6;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Resize
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+window.addEventListener('resize', () => {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Animation — breathing + skip emission pulse
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Data Loading + Block Coloring
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Block name mapping: viz names → profile names
+// Some viz names don't have the .0 suffix that profiles use
+const VIZ_TO_PROFILE = {
+  'input_blocks.0':   null,                // Conv In — no profile data
+  'input_blocks.3':   'input_blocks.3.0',  // Downsample
+  'input_blocks.6':   'input_blocks.6.0',  // Downsample
+  'output_blocks.2.0': 'output_blocks.2.2', // Viz transition block → actual Upsample L3→L2
+  'output_blocks.5.0': 'output_blocks.5.2', // Viz transition block → actual Upsample L2→L1
+  'output_blocks.6':  'output_blocks.6.0',
+  'output_blocks.7':  'output_blocks.7.0',
+};
+
+function vizToProfileName(vizName) {
+  if (vizName in VIZ_TO_PROFILE) return VIZ_TO_PROFILE[vizName];
+  return vizName; // direct match for most blocks
+}
+
+// Color ramp: cold near-black → hot bright brass with glow
+const COLOR_COLD = new THREE.Color(0x2a2e38);  // near-black: unmistakably "off"
+const COLOR_HOT  = new THREE.Color(0xf0c855);  // bright warm gold
+const EMISSIVE_HOT = new THREE.Color(0xe8bd73);
+
+function activationColor(normalizedValue) {
+  const t = Math.max(0, Math.min(1, normalizedValue));
+  const color = COLOR_COLD.clone().lerp(COLOR_HOT, t);
+  // Emissive glow ramps continuously from 0 — every block shows its magnitude
+  // Low activation: barely visible. High activation: bright self-illumination.
+  const emissiveIntensity = t * t * 2.2;  // quadratic glow: low blocks stay matte, hot blocks self-illuminate strongly
+  return { color, emissiveIntensity };
+}
+
+// State
+let vizIndex = null;
+let currentVizData = null;
+let currentTimestep = null;
+let currentProfileKey = null;
+let loadAbortController = null;
+
+// Data path base (relative to HTML file location)
+const DATA_BASE = 'activation-mapping/';
+
+async function loadIndex() {
+  try {
+    const resp = await fetch(DATA_BASE + 'profiles/viz/index.json');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    vizIndex = await resp.json();
+    console.log(`Loaded index: ${vizIndex.profiles.length} profiles`);
+    return vizIndex;
+  } catch (e) {
+    console.warn('Could not load viz index:', e.message);
+    return null;
+  }
+}
+
+async function loadProfile(profileKey) {
+  // Abort any in-flight profile load
+  if (loadAbortController) loadAbortController.abort();
+  loadAbortController = new AbortController();
+  const { signal } = loadAbortController;
+
+  try {
+    // Use viz_json path from index when available
+    let url = DATA_BASE + `profiles/viz/${profileKey}.viz.json`;
+    if (vizIndex) {
+      const profileInfo = vizIndex.profiles.find(p => p.key === profileKey);
+      if (profileInfo?.viz_json) {
+        url = DATA_BASE + profileInfo.viz_json.replace(/^activation-mapping\//, '');
+      }
+    }
+
+    const resp = await fetch(url, { signal, cache: 'no-store' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    currentVizData = await resp.json();
+    currentProfileKey = profileKey;
+
+    // Set initial timestep (middle of range)
+    const steps = currentVizData.timesteps;
+    currentTimestep = String(steps[Math.floor(steps.length / 2)]);
+    console.log(`Loaded profile: ${profileKey} (${steps.length} timesteps)`);
+
+    updateBlockColors();
+    updateCrossAttention();
+    if (typeof updateCfgToggleVisibility === 'function') updateCfgToggleVisibility();
+    updateUI();
+    return currentVizData;
+  } catch (e) {
+    if (e.name === 'AbortError') return null; // superseded by newer load
+    console.warn('Could not load profile:', e.message);
+    // Reset to no-data state, show static cross-attention indicators
+    updateCrossAttention();
+    return null;
+  }
+}
+
+function updateBlockColors() {
+  if (!currentVizData || !currentTimestep) return;
+
+  const blockData = currentVizData.blocks[currentTimestep];
+  if (!blockData) {
+    console.warn('No block data for timestep', currentTimestep);
+    return;
+  }
+
+  // CFG view mode: use different data source for coloring
+  const cfgData = currentVizData?.cfg_split?.[currentTimestep];
+  const useCfgMode = typeof cfgViewMode !== 'undefined' && cfgViewMode !== 'merged' && cfgData;
+
+  // Get normalization bounds for this timestep
+  const normBounds = currentVizData.normalization.per_step[currentTimestep]
+    || currentVizData.normalization.global;
+  const p5 = normBounds.p5;
+  const p95 = normBounds.p95;
+  const range = p95 - p5;
+
+  // For CFG modes, compute dynamic normalization
+  let cfgValues = [];
+  if (useCfgMode) {
+    Object.values(cfgData).forEach(s => {
+      if (cfgViewMode === 'cond') cfgValues.push(Math.log1p(s.cond_norm || 0));
+      else if (cfgViewMode === 'uncond') cfgValues.push(Math.log1p(s.uncond_norm || 0));
+      else if (cfgViewMode === 'delta') cfgValues.push(Math.log1p(s.cfg_divergence || 0));
+    });
+    cfgValues.sort((a, b) => a - b);
+  }
+  const cfgP5 = cfgValues.length > 0 ? cfgValues[Math.floor(cfgValues.length * 0.05)] : 0;
+  const cfgP95 = cfgValues.length > 0 ? cfgValues[Math.floor(cfgValues.length * 0.95)] : 1;
+  const cfgRange = cfgP95 - cfgP5;
+
+  let mapped = 0, unmapped = 0;
+
+  somaMeshes.forEach((mesh, vizName) => {
+    const profileName = vizToProfileName(vizName);
+    if (!profileName || !blockData[profileName]) {
+      mesh.material.color.copy(COLOR_COLD);
+      mesh.material.emissive.setHex(0x000000);
+      mesh.material.emissiveIntensity = 0;
+      unmapped++;
+      return;
+    }
+
+    let logNorm, normP5, normRange;
+
+    if (useCfgMode && cfgData[profileName]) {
+      const cfgStats = cfgData[profileName];
+      if (cfgViewMode === 'cond') logNorm = Math.log1p(cfgStats.cond_norm || 0);
+      else if (cfgViewMode === 'uncond') logNorm = Math.log1p(cfgStats.uncond_norm || 0);
+      else if (cfgViewMode === 'delta') logNorm = Math.log1p(cfgStats.cfg_divergence || 0);
+      normP5 = cfgP5;
+      normRange = cfgRange;
+    } else {
+      const stats = blockData[profileName];
+      logNorm = stats.log_norm ?? Math.log1p(stats.norm ?? 0);
+      normP5 = p5;
+      normRange = range;
+    }
+
+    const normalized = normRange > 0 ? (logNorm - normP5) / normRange : 0.5;
+    const clamped = Math.max(0, Math.min(1, isFinite(normalized) ? normalized : 0));
+
+    const { color, emissiveIntensity } = activationColor(clamped);
+    mesh.material.color.copy(color);
+    mesh.material.emissive.copy(EMISSIVE_HOT);
+    mesh.material.emissiveIntensity = emissiveIntensity;
+    mapped++;
+  });
+}
+
+// Expose state for debugging
+window._vizDebug = {
+  somaMeshes, updateBlockColors, fullSequence, blocks, camera,
+  get currentVizData() { return currentVizData; },
+  get currentTimestep() { return currentTimestep; },
+  get activeBlockIndex() { return activeBlockIndex; },
+  set activeBlockIndex(v) { activeBlockIndex = v; },
+  get isPlaying() { return isPlaying; },
+  set isPlaying(v) { isPlaying = v; },
+  get selectedBlockName() { return selectedBlockName; },
+  get annotations() { return loadAnnotations(); },
+  selectBlock, deselectBlock, loadAnnotations, addAnnotation,
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// UI — Step Slider, Image Panel, Profile Selector
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Create UI container
+const uiContainer = document.createElement('div');
+uiContainer.id = 'viz-ui';
+uiContainer.innerHTML = `
+  <div id="profile-selector-container">
+    <select id="profile-select"></select>
+  </div>
+  <div id="transport-container">
+    <div id="transport-controls">
+      <button id="play-btn" title="Play/Pause">&#9654;</button>
+      <button id="mode-btn" title="Toggle mode: block/step">BLK</button>
+      <div id="speed-controls">
+        <button class="speed-btn" data-speed="0.2">0.2x</button>
+        <button class="speed-btn" data-speed="0.5">0.5x</button>
+        <button class="speed-btn" data-speed="1">1x</button>
+        <button class="speed-btn active" data-speed="3">3x</button>
+        <button class="speed-btn" data-speed="8">8x</button>
+      </div>
+    </div>
+    <div id="sliders-column">
+      <div id="step-slider-container">
+        <label id="step-label">Step —</label>
+        <input type="range" id="step-slider" min="1" max="29" value="15" step="1">
+      </div>
+      <div id="block-slider-container">
+        <label id="block-label">Block —</label>
+        <input type="range" id="block-slider" min="0" max="30" value="0" step="1">
+      </div>
+    </div>
+  </div>
+  <div id="image-panel">
+    <img id="intermediate-img" alt="Intermediate">
+    <div id="image-caption"></div>
+    <canvas id="head-norms-chart" width="240" height="40" style="display:none; margin-top:2px;"></canvas>
+  </div>
+  <div id="info-panel">
+    <div id="info-character"></div>
+    <div id="info-prompt"></div>
+  </div>
+  <div id="block-detail-panel">
+    <div id="block-detail-header">
+      <span id="detail-block-name"></span>
+      <span id="detail-close">&times;</span>
+    </div>
+    <div id="detail-type"></div>
+    <div id="detail-channels"></div>
+    <div class="detail-section" id="detail-stats"></div>
+    <div class="detail-section" id="detail-channel-section" style="display:none;">
+      <div class="detail-section-label">CHANNEL GROUPS</div>
+      <div class="channel-groups-grid" id="channel-groups"></div>
+      <div id="channel-detail-row"></div>
+    </div>
+    <div class="detail-section" id="detail-cross-attn"></div>
+    <div class="detail-section" id="detail-annotations-section">
+      <div class="detail-section-label">ANNOTATIONS</div>
+      <div id="detail-ann-list"></div>
+      <button id="add-annotation-btn">+ Annotate</button>
+    </div>
+    <div class="detail-section" id="detail-intervention-section">
+      <div class="detail-section-label">INTERVENTION</div>
+      <div id="intervention-config">
+        <div class="intervention-row">
+          <label>Operation</label>
+          <select id="intervention-op">
+            <option value="zero">Zero</option>
+            <option value="amplify">Amplify</option>
+            <option value="clamp">Clamp</option>
+          </select>
+        </div>
+        <div class="intervention-row" id="intervention-mag-row" style="display:none;">
+          <label>Magnitude</label>
+          <input type="number" id="intervention-mag" value="2.0" step="0.5" min="0" max="20" />
+        </div>
+        <div class="intervention-row">
+          <label>Channels</label>
+          <select id="intervention-channels">
+            <option value="all">All</option>
+          </select>
+        </div>
+        <div class="intervention-row">
+          <label>Steps</label>
+          <select id="intervention-steps">
+            <option value="all">All steps</option>
+            <option value="current">Current step only</option>
+            <option value="early">Early (1-7)</option>
+            <option value="late">Late (20-29)</option>
+          </select>
+        </div>
+        <button id="add-intervention-btn">+ Add to Queue</button>
+      </div>
+    </div>
+  </div>
+  <div id="annotation-modal-overlay" style="display:none;">
+    <div id="annotation-modal">
+      <div class="ann-modal-header">
+        <span id="ann-modal-title">ADD ANNOTATION</span>
+        <span id="ann-modal-close">&times;</span>
+      </div>
+      <div id="ann-modal-context"></div>
+      <textarea id="ann-modal-note" placeholder="What do you observe at this block?"></textarea>
+      <div class="ann-modal-tags" id="ann-modal-tags">
+        <span class="ann-tag-chip" data-tag="structure">structure</span>
+        <span class="ann-tag-chip" data-tag="style">style</span>
+        <span class="ann-tag-chip" data-tag="identity">identity</span>
+        <span class="ann-tag-chip" data-tag="scene">scene</span>
+        <span class="ann-tag-chip" data-tag="color">color</span>
+        <span class="ann-tag-chip" data-tag="anomaly">anomaly</span>
+      </div>
+      <div class="ann-modal-actions">
+        <button id="ann-modal-cancel">Cancel</button>
+        <button id="ann-modal-save">Save</button>
+      </div>
+    </div>
+  </div>
+  <button id="annotation-list-toggle">Notes (0)</button>
+  <div id="annotation-list-panel" style="display:none;">
+    <div id="annotation-list-content"></div>
+  </div>
+  <div id="intervention-queue-panel" style="display:none;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <div class="detail-section-label" style="margin:0;">INTERVENTION QUEUE</div>
+      <span id="iq-close" style="cursor:pointer;opacity:0.4;font-size:12px;">&times;</span>
+    </div>
+    <div id="iq-list"></div>
+    <div id="iq-actions" style="display:flex;gap:6px;margin-top:8px;">
+      <button id="iq-copy" style="flex:1;">Copy Config</button>
+      <button id="iq-clear" style="flex:1;opacity:0.5;">Clear All</button>
+    </div>
+  </div>
+  <button id="iq-toggle" style="display:none;">Interventions (0)</button>
+  <button id="cfg-toggle" title="CFG view mode">CFG: Merged</button>
+  <button id="compare-toggle">Compare</button>
+  <div id="compare-panel" style="display:none;">
+    <div class="detail-section-label">COMPARISON MODE</div>
+    <div class="compare-row">
+      <label>Profile A</label>
+      <select id="compare-a"></select>
+    </div>
+    <div class="compare-row">
+      <label>Profile B</label>
+      <select id="compare-b"></select>
+    </div>
+    <div class="compare-row">
+      <label>Show</label>
+      <select id="compare-mode">
+        <option value="diff">Difference (A-B)</option>
+        <option value="side-by-side">Side by Side</option>
+      </select>
+    </div>
+    <button id="compare-load">Load Comparison</button>
+    <button id="compare-exit" style="display:none;">Exit Comparison</button>
+  </div>
+`;
+document.body.appendChild(uiContainer);
+
+// Style the UI
+const uiStyle = document.createElement('style');
+uiStyle.textContent = `
+  #viz-ui {
+    position: fixed; z-index: 20;
+    pointer-events: none;
+  }
+
+  #profile-selector-container {
+    position: fixed; top: 28px; right: 28px;
+    pointer-events: auto; z-index: 20;
+  }
+  #profile-select {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px; font-weight: 400;
+    letter-spacing: 0.05em;
+    padding: 6px 12px;
+    background: rgba(0,0,0,0.06);
+    border: 1px solid rgba(0,0,0,0.1);
+    border-radius: 3px;
+    color: rgba(0,0,0,0.55);
+    cursor: pointer;
+    outline: none;
+    -webkit-appearance: none;
+    appearance: none;
+  }
+  #profile-select:hover {
+    background: rgba(0,0,0,0.10);
+    color: rgba(0,0,0,0.7);
+  }
+
+  #transport-container {
+    position: fixed; bottom: 40px; left: 50%;
+    transform: translateX(-50%);
+    display: flex; align-items: center; gap: 14px;
+    pointer-events: auto; z-index: 20;
+    background: rgba(0,0,0,0.05);
+    padding: 10px 20px;
+    border-radius: 20px;
+    backdrop-filter: blur(4px);
+  }
+  #transport-controls {
+    display: flex; align-items: center; gap: 6px;
+    flex-shrink: 0;
+  }
+  #play-btn, #mode-btn {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px; font-weight: 400;
+    width: 28px; height: 28px;
+    border: 1px solid rgba(0,0,0,0.12);
+    border-radius: 50%;
+    background: rgba(0,0,0,0.04);
+    color: rgba(0,0,0,0.5);
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    padding: 0;
+    transition: background 0.15s, color 0.15s;
+  }
+  #play-btn:hover, #mode-btn:hover {
+    background: rgba(0,0,0,0.1);
+    color: rgba(0,0,0,0.7);
+  }
+  #play-btn.playing {
+    background: rgba(232,189,115,0.15);
+    border-color: rgba(232,189,115,0.4);
+    color: #c8a050;
+  }
+  #mode-btn {
+    font-size: 7px; letter-spacing: 0.05em;
+    border-radius: 4px; width: auto; padding: 0 6px;
+  }
+  #speed-controls {
+    display: flex; gap: 2px;
+  }
+  .speed-btn {
+    font-family: 'DM Mono', monospace;
+    font-size: 8px; font-weight: 300;
+    padding: 2px 5px;
+    border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 3px;
+    background: transparent;
+    color: rgba(0,0,0,0.3);
+    cursor: pointer;
+    letter-spacing: 0.02em;
+    transition: all 0.15s;
+  }
+  .speed-btn:hover { color: rgba(0,0,0,0.5); }
+  .speed-btn.active {
+    background: rgba(0,0,0,0.06);
+    color: rgba(0,0,0,0.55);
+    border-color: rgba(0,0,0,0.15);
+  }
+
+  #sliders-column {
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  #step-slider-container, #block-slider-container {
+    display: flex; align-items: center; gap: 10px;
+  }
+  #step-label, #block-label {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px; font-weight: 400;
+    color: rgba(0,0,0,0.45);
+    letter-spacing: 0.08em;
+    white-space: nowrap;
+    min-width: 72px;
+  }
+  #block-label { color: rgba(0,0,0,0.3); }
+  #step-slider, #block-slider {
+    width: 240px;
+    height: 2px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: rgba(0,0,0,0.12);
+    border-radius: 1px;
+    outline: none;
+    cursor: pointer;
+  }
+  #step-slider::-webkit-slider-thumb, #block-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: #e8bd73;
+    border: 2px solid rgba(0,0,0,0.15);
+    cursor: pointer;
+  }
+  #block-slider::-webkit-slider-thumb {
+    width: 10px; height: 10px;
+    background: #c8a868;
+  }
+
+  #image-panel {
+    position: fixed; bottom: 100px; left: 28px;
+    width: 180px;
+    pointer-events: auto; z-index: 20;
+    background: rgba(0,0,0,0.06);
+    border-radius: 4px;
+    overflow: hidden;
+    backdrop-filter: blur(4px);
+    border: 1px solid rgba(0,0,0,0.08);
+    display: none; /* hidden until image loads */
+    cursor: pointer;
+  }
+  #intermediate-img {
+    width: 100%;
+    display: block;
+    image-rendering: auto;
+  }
+  #image-caption {
+    font-family: 'DM Mono', monospace;
+    font-size: 8px; font-weight: 300;
+    color: rgba(0,0,0,0.35);
+    padding: 4px 6px;
+    text-align: center;
+    letter-spacing: 0.1em;
+  }
+  /* Expanded image overlay */
+  #image-overlay {
+    position: fixed; inset: 0;
+    z-index: 1000;
+    background: rgba(0,0,0,0.7);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(6px);
+    cursor: pointer;
+  }
+  #image-overlay.active { display: flex; }
+  #image-overlay img {
+    max-width: min(400px, 50vw);
+    max-height: 80vh;
+    border-radius: 6px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    image-rendering: auto;
+  }
+  #image-overlay-close {
+    position: absolute; top: 20px; right: 24px;
+    font-size: 28px; color: rgba(255,255,255,0.7);
+    cursor: pointer; z-index: 1001;
+    font-family: 'DM Mono', monospace;
+    line-height: 1;
+    transition: color 0.15s;
+  }
+  #image-overlay-close:hover { color: #fff; }
+
+  #info-panel {
+    position: fixed; top: 28px; left: 200px;
+    z-index: 20; pointer-events: none;
+    display: none; /* redundant — character + prompt shown in .tl hero label */
+  }
+  #info-character {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px; font-weight: 400;
+    color: rgba(0,0,0,0.35);
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+  }
+  #info-prompt {
+    font-family: 'DM Mono', monospace;
+    font-size: 8px; font-weight: 300;
+    color: rgba(0,0,0,0.2);
+    margin-top: 4px;
+    max-width: 400px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Phase 4: Block Detail Panel */
+  #block-detail-panel {
+    position: fixed; top: 80px; right: 28px;
+    width: 260px;
+    pointer-events: auto; z-index: 20;
+    background: rgba(0,0,0,0.06);
+    border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 6px;
+    backdrop-filter: blur(6px);
+    padding: 14px 16px;
+    display: none;
+    max-height: calc(100vh - 160px);
+    overflow-y: auto;
+  }
+  #block-detail-panel::-webkit-scrollbar { width: 3px; }
+  #block-detail-panel::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 2px; }
+  #block-detail-header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 8px;
+  }
+  #detail-block-name {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px; font-weight: 400;
+    color: rgba(0,0,0,0.6);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  #detail-close {
+    font-size: 14px; color: rgba(0,0,0,0.3);
+    cursor: pointer; line-height: 1;
+  }
+  #detail-close:hover { color: rgba(0,0,0,0.6); }
+  #detail-type, #detail-channels {
+    font-family: 'DM Mono', monospace;
+    font-size: 8px; font-weight: 300;
+    color: rgba(0,0,0,0.3);
+    letter-spacing: 0.08em;
+    margin-bottom: 2px;
+  }
+  .detail-section {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(0,0,0,0.06);
+  }
+  .detail-section-label {
+    font-family: 'DM Mono', monospace;
+    font-size: 7px; font-weight: 400;
+    color: rgba(0,0,0,0.25);
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .detail-stat-row {
+    display: flex; justify-content: space-between;
+    font-family: 'DM Mono', monospace;
+    font-size: 9px; color: rgba(0,0,0,0.45);
+    margin-bottom: 3px;
+  }
+  .detail-stat-value {
+    font-weight: 400; color: rgba(0,0,0,0.55);
+  }
+
+  /* Channel Groups */
+  .channel-groups-grid {
+    display: flex; flex-wrap: wrap; gap: 2px;
+    margin-top: 4px;
+  }
+  .ch-group-cell {
+    width: 10px; height: 10px;
+    border-radius: 1px;
+    cursor: pointer;
+    transition: transform 0.1s;
+    position: relative;
+  }
+  .ch-group-cell:hover {
+    transform: scale(1.8);
+    z-index: 1;
+  }
+  .ch-group-cell[title]::after {
+    content: attr(title);
+    display: none;
+  }
+  #channel-detail-row {
+    font-family: 'DM Mono', monospace;
+    font-size: 8px; color: rgba(0,0,0,0.35);
+    margin-top: 6px;
+    min-height: 14px;
+  }
+
+  /* Cross-attention detail */
+  #detail-cross-attn {
+    font-family: 'DM Mono', monospace;
+    font-size: 8px; color: rgba(0,0,0,0.35);
+    margin-top: 4px;
+  }
+  .cross-attn-active { color: #c8a050; }
+
+  /* Annotation section in detail panel */
+  #detail-ann-list {
+    max-height: 120px;
+    overflow-y: auto;
+    margin: 4px 0;
+  }
+  .annotation-item {
+    font-family: 'DM Mono', monospace;
+    font-size: 8px; color: rgba(0,0,0,0.4);
+    padding: 4px 6px;
+    background: rgba(0,0,0,0.03);
+    border-radius: 3px;
+    margin-bottom: 3px;
+    position: relative;
+  }
+  .annotation-item .ann-tags {
+    margin-top: 2px;
+  }
+  .annotation-item .ann-tag {
+    display: inline-block;
+    font-size: 7px;
+    padding: 1px 4px;
+    background: rgba(232,189,115,0.15);
+    color: #a08040;
+    border-radius: 2px;
+    margin-right: 2px;
+  }
+  .annotation-item .ann-delete {
+    position: absolute; top: 3px; right: 4px;
+    font-size: 9px; color: rgba(0,0,0,0.2);
+    cursor: pointer;
+  }
+  .annotation-item .ann-delete:hover { color: rgba(200,0,0,0.5); }
+  #add-annotation-btn {
+    font-family: 'DM Mono', monospace;
+    font-size: 8px; font-weight: 400;
+    padding: 4px 10px;
+    background: rgba(232,189,115,0.12);
+    border: 1px solid rgba(232,189,115,0.25);
+    border-radius: 3px;
+    color: #a08040;
+    cursor: pointer;
+    letter-spacing: 0.05em;
+    margin-top: 4px;
+  }
+  #add-annotation-btn:hover {
+    background: rgba(232,189,115,0.22);
+  }
+
+  /* Annotation Modal */
+  #annotation-modal-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.25);
+    z-index: 100;
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(2px);
+    pointer-events: auto;
+  }
+  #annotation-modal {
+    background: #e8e5e0;
+    border: 1px solid rgba(0,0,0,0.12);
+    border-radius: 8px;
+    padding: 20px 24px;
+    width: 380px;
+    max-width: 90vw;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.12);
+  }
+  .ann-modal-header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px;
+  }
+  #ann-modal-title {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px; font-weight: 400;
+    color: rgba(0,0,0,0.55);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  #ann-modal-close {
+    font-size: 16px; color: rgba(0,0,0,0.3);
+    cursor: pointer;
+  }
+  #ann-modal-close:hover { color: rgba(0,0,0,0.6); }
+  #ann-modal-context {
+    font-family: 'DM Mono', monospace;
+    font-size: 8px; color: rgba(0,0,0,0.35);
+    margin-bottom: 10px;
+    letter-spacing: 0.05em;
+  }
+  #ann-modal-note {
+    width: 100%;
+    height: 80px;
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    padding: 8px 10px;
+    border: 1px solid rgba(0,0,0,0.1);
+    border-radius: 4px;
+    background: rgba(255,255,255,0.5);
+    color: rgba(0,0,0,0.6);
+    resize: vertical;
+    outline: none;
+  }
+  #ann-modal-note:focus {
+    border-color: rgba(232,189,115,0.5);
+  }
+  .ann-modal-tags {
+    display: flex; flex-wrap: wrap; gap: 4px;
+    margin: 10px 0;
+  }
+  .ann-tag-chip {
+    font-family: 'DM Mono', monospace;
+    font-size: 8px;
+    padding: 3px 8px;
+    border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 10px;
+    color: rgba(0,0,0,0.35);
+    cursor: pointer;
+    transition: all 0.15s;
+    user-select: none;
+  }
+  .ann-tag-chip:hover {
+    border-color: rgba(0,0,0,0.2);
+    color: rgba(0,0,0,0.5);
+  }
+  .ann-tag-chip.selected {
+    background: rgba(232,189,115,0.2);
+    border-color: rgba(232,189,115,0.4);
+    color: #a08040;
+  }
+  .ann-modal-actions {
+    display: flex; justify-content: flex-end; gap: 8px;
+    margin-top: 12px;
+  }
+  .ann-modal-actions button {
+    font-family: 'DM Mono', monospace;
+    font-size: 9px; font-weight: 400;
+    padding: 5px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    letter-spacing: 0.05em;
+  }
+  #ann-modal-cancel {
+    background: transparent;
+    border: 1px solid rgba(0,0,0,0.1);
+    color: rgba(0,0,0,0.4);
+  }
+  #ann-modal-save {
+    background: rgba(232,189,115,0.2);
+    border: 1px solid rgba(232,189,115,0.35);
+    color: #907030;
+  }
+  #ann-modal-save:hover {
+    background: rgba(232,189,115,0.35);
+  }
+
+  /* Annotation List Toggle */
+  #annotation-list-toggle {
+    position: fixed; top: 28px; right: 200px;
+    pointer-events: auto; z-index: 20;
+    font-family: 'DM Mono', monospace;
+    font-size: 9px; font-weight: 400;
+    padding: 5px 10px;
+    background: rgba(0,0,0,0.04);
+    border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 3px;
+    color: rgba(0,0,0,0.4);
+    cursor: pointer;
+    letter-spacing: 0.05em;
+  }
+  #annotation-list-toggle:hover {
+    background: rgba(0,0,0,0.08);
+    color: rgba(0,0,0,0.6);
+  }
+  #annotation-list-panel {
+    position: fixed; top: 60px; right: 200px;
+    width: 300px;
+    max-height: 400px;
+    overflow-y: auto;
+    pointer-events: auto; z-index: 20;
+    background: rgba(0,0,0,0.06);
+    border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 6px;
+    backdrop-filter: blur(6px);
+    padding: 12px;
+  }
+  #annotation-list-panel .annotation-item {
+    cursor: pointer;
+  }
+  #annotation-list-panel .annotation-item:hover {
+    background: rgba(0,0,0,0.06);
+  }
+  .ann-list-empty {
+    font-family: 'DM Mono', monospace;
+    font-size: 9px; color: rgba(0,0,0,0.25);
+    text-align: center;
+    padding: 20px 0;
+  }
+
+  /* Phase 5 — Intervention builder */
+  #detail-intervention-section {
+    border-top: 1px solid rgba(0,0,0,0.06);
+    padding-top: 8px;
+  }
+  .intervention-row {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 4px;
+  }
+  .intervention-row label {
+    font-family: 'DM Mono', monospace;
+    font-size: 8px; color: rgba(0,0,0,0.4);
+    letter-spacing: 0.05em; text-transform: uppercase;
+  }
+  .intervention-row select, .intervention-row input {
+    font-family: 'DM Mono', monospace;
+    font-size: 9px; background: rgba(0,0,0,0.04);
+    border: 1px solid rgba(0,0,0,0.08); border-radius: 3px;
+    padding: 2px 4px; width: 110px; color: #333;
+  }
+  #add-intervention-btn {
+    font-family: 'DM Mono', monospace;
+    font-size: 8px; background: rgba(232,189,115,0.15);
+    border: 1px solid rgba(232,189,115,0.3); border-radius: 3px;
+    padding: 4px 8px; cursor: pointer; margin-top: 4px;
+    color: #a08040; width: 100%;
+  }
+  #add-intervention-btn:hover { background: rgba(232,189,115,0.25); }
+
+  /* Intervention queue panel */
+  #intervention-queue-panel {
+    position: fixed; bottom: 100px; left: 28px;
+    width: 280px; pointer-events: auto; z-index: 20;
+    background: rgba(0,0,0,0.06); border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 6px; backdrop-filter: blur(6px);
+    padding: 12px 14px; max-height: 300px; overflow-y: auto;
+    font-family: 'DM Mono', monospace;
+  }
+  .iq-item {
+    font-size: 9px; padding: 6px 8px;
+    background: rgba(0,0,0,0.03); border-radius: 3px;
+    margin-bottom: 3px; display: flex;
+    justify-content: space-between; align-items: center;
+  }
+  .iq-item .iq-remove {
+    cursor: pointer; opacity: 0.3; font-size: 10px;
+  }
+  .iq-item .iq-remove:hover { opacity: 0.7; }
+  #iq-toggle {
+    position: fixed; bottom: 76px; left: 28px;
+    font-family: 'DM Mono', monospace; font-size: 9px;
+    background: rgba(232,189,115,0.12); border: 1px solid rgba(232,189,115,0.25);
+    border-radius: 4px; padding: 4px 10px; cursor: pointer;
+    pointer-events: auto; z-index: 20; color: #a08040;
+  }
+  #iq-toggle:hover { background: rgba(232,189,115,0.2); }
+  #iq-actions button {
+    font-family: 'DM Mono', monospace; font-size: 8px;
+    padding: 4px 8px; border-radius: 3px; cursor: pointer;
+    border: 1px solid rgba(0,0,0,0.08);
+    background: rgba(0,0,0,0.04);
+  }
+  #iq-copy { color: #a08040; border-color: rgba(232,189,115,0.3); background: rgba(232,189,115,0.1); }
+  #iq-copy:hover { background: rgba(232,189,115,0.2); }
+
+  /* CFG view toggle */
+  #cfg-toggle {
+    position: fixed; bottom: 28px; left: 158px;
+    font-family: 'DM Mono', monospace; font-size: 9px;
+    background: rgba(0,0,0,0.04); border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 4px; padding: 4px 10px; cursor: pointer;
+    pointer-events: auto; z-index: 20;
+    display: none; /* hidden until v2 data loads */
+  }
+  #cfg-toggle:hover { background: rgba(0,0,0,0.08); }
+  #cfg-toggle.active {
+    background: rgba(180,140,60,0.15); border-color: rgba(232,189,115,0.3);
+    color: #a08040;
+  }
+
+  /* Compare mode */
+  #compare-toggle {
+    position: fixed; bottom: 28px; left: 258px;
+    font-family: 'DM Mono', monospace; font-size: 9px;
+    background: rgba(0,0,0,0.04); border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 4px; padding: 4px 10px; cursor: pointer;
+    pointer-events: auto; z-index: 20;
+  }
+  #compare-toggle:hover { background: rgba(0,0,0,0.08); }
+  #compare-toggle.active {
+    background: rgba(100,180,220,0.15); border-color: rgba(100,180,220,0.3);
+    color: #4090b0;
+  }
+  #compare-panel {
+    position: fixed; bottom: 60px; left: 258px;
+    width: 240px; pointer-events: auto; z-index: 20;
+    background: rgba(0,0,0,0.06); border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 6px; backdrop-filter: blur(6px);
+    padding: 12px 14px;
+    font-family: 'DM Mono', monospace;
+  }
+  .compare-row {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 4px;
+  }
+  .compare-row label {
+    font-size: 8px; color: rgba(0,0,0,0.4);
+    letter-spacing: 0.05em; text-transform: uppercase;
+  }
+  .compare-row select {
+    font-family: 'DM Mono', monospace;
+    font-size: 9px; background: rgba(0,0,0,0.04);
+    border: 1px solid rgba(0,0,0,0.08); border-radius: 3px;
+    padding: 2px 4px; width: 140px; color: #333;
+  }
+  #compare-load, #compare-exit {
+    font-family: 'DM Mono', monospace; font-size: 8px;
+    padding: 4px 8px; border-radius: 3px; cursor: pointer;
+    border: 1px solid rgba(0,0,0,0.08); background: rgba(0,0,0,0.04);
+    width: 100%; margin-top: 4px;
+  }
+  #compare-load:hover, #compare-exit:hover { background: rgba(0,0,0,0.08); }
+  #compare-exit { color: #c06040; border-color: rgba(192,96,64,0.3); background: rgba(192,96,64,0.08); }
+
+  /* Compare diff overlay */
+  #compare-image-b {
+    position: fixed; bottom: 28px; right: 28px;
+    border-radius: 4px; border: 1px solid rgba(0,0,0,0.08);
+    pointer-events: auto; z-index: 15;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  }
+`;
+document.head.appendChild(uiStyle);
+
+// Wire up UI elements
+const stepSlider = document.getElementById('step-slider');
+const stepLabel = document.getElementById('step-label');
+const blockSlider = document.getElementById('block-slider');
+const blockLabel = document.getElementById('block-label');
+const playBtn = document.getElementById('play-btn');
+const modeBtn = document.getElementById('mode-btn');
+const profileSelect = document.getElementById('profile-select');
+const intermediateImg = document.getElementById('intermediate-img');
+const imagePanel = document.getElementById('image-panel');
+const imageCaption = document.getElementById('image-caption');
+const headNormsChart = document.getElementById('head-norms-chart');
+const infoCharacter = document.getElementById('info-character');
+const infoPrompt = document.getElementById('info-prompt');
+
+// Set block slider max
+blockSlider.max = String(fullSequence.length - 1);
+
+// Prevent OrbitControls from intercepting UI events
+['pointerdown', 'wheel'].forEach(evt => {
+  document.getElementById('transport-container').addEventListener(evt, e => e.stopPropagation());
+  document.getElementById('profile-selector-container').addEventListener(evt, e => e.stopPropagation());
+  document.getElementById('image-panel').addEventListener(evt, e => e.stopPropagation());
+});
+
+// Click-to-expand intermediate image overlay
+const imageOverlay = document.getElementById('image-overlay');
+const overlayImg = document.getElementById('overlay-img');
+const overlayClose = document.getElementById('image-overlay-close');
+
+imagePanel.addEventListener('click', () => {
+  if (intermediateImg.src) {
+    overlayImg.src = intermediateImg.src;
+    imageOverlay.classList.add('active');
+  }
+});
+overlayClose.addEventListener('click', (e) => {
+  e.stopPropagation();
+  imageOverlay.classList.remove('active');
+});
+imageOverlay.addEventListener('click', () => {
+  imageOverlay.classList.remove('active');
+});
+overlayImg.addEventListener('click', (e) => {
+  e.stopPropagation(); // don't close when clicking the image itself
+});
+
+// Step slider
+stepSlider.addEventListener('input', () => {
+  if (!currentVizData) return;
+  const stepNum = parseInt(stepSlider.value);
+
+  const available = currentVizData.timesteps;
+  let closest = available[0];
+  let closestDist = Math.abs(stepNum - closest);
+  for (const ts of available) {
+    const dist = Math.abs(stepNum - ts);
+    if (dist < closestDist) { closest = ts; closestDist = dist; }
+  }
+
+  currentTimestep = String(closest);
+  // Reset block position when changing step
+  if (activeBlockIndex >= 0) {
+    setReplayCursor(0, 0);
+    updateBlockSlider();
+    updateBlockImage(fullSequence[0]);
+  } else {
+    setReplayCursor(-1, 0);
+  }
+  updateBlockColors();
+  updateCrossAttention();
+  if (typeof updateExpansionColors === 'function') updateExpansionColors();
+  if (typeof updatePcaBrainScan === 'function') updatePcaBrainScan();
+  updateUI();
+});
+
+// Block slider — scrub within-step block position
+blockSlider.addEventListener('input', () => {
+  const idx = parseInt(blockSlider.value);
+  setReplayCursor(idx, 0);
+  updateBlockSlider();
+  // Update per-block image when scrubbing
+  if (activeBlockIndex >= 0 && activeBlockIndex < fullSequence.length) {
+    updateBlockImage(fullSequence[activeBlockIndex]);
+  }
+  // Pause autoplay when manually scrubbing
+  if (isPlaying) {
+    isPlaying = false;
+    updatePlayButton();
+  }
+});
+
+// Play/Pause button
+playBtn.addEventListener('click', () => {
+  if (!currentVizData) return;
+
+  isPlaying = !isPlaying;
+  if (isPlaying) {
+    // Start from beginning if at end or no block selected
+    if (activeBlockIndex < 0 || activeBlockIndex >= fullSequence.length - 1) {
+      setReplayCursor(0, 0);
+      updateBlockImage(fullSequence[0]);
+    }
+    lastPlayTime = performance.now() / 1000;
+  }
+  updatePlayButton();
+  updateBlockSlider();
+});
+
+// Mode toggle
+modeBtn.addEventListener('click', () => {
+  playMode = playMode === 'block' ? 'step' : 'block';
+  modeBtn.textContent = playMode === 'block' ? 'BLK' : 'STP';
+  modeBtn.title = playMode === 'block'
+    ? 'Mode: block-level (flows through blocks within each step)'
+    : 'Mode: step-level (jumps between diffusion steps)';
+});
+
+// Speed buttons
+document.querySelectorAll('.speed-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    playSpeed = parseFloat(btn.dataset.speed);
+    document.querySelectorAll('.speed-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  });
+});
+
+function updatePlayButton() {
+  playBtn.textContent = isPlaying ? '\u23F8' : '\u25B6';
+  playBtn.classList.toggle('playing', isPlaying);
+}
+
+function updateBlockSlider() {
+  blockSlider.value = String(Math.max(0, activeBlockIndex));
+  const idx = Math.max(0, activeBlockIndex);
+  blockLabel.textContent = activeBlockIndex >= 0
+    ? `Block ${idx + 1}/${fullSequence.length}`
+    : 'Block \u2014';
+}
+
+// Stop replay — called when changing profiles
+function stopReplay() {
+  isPlaying = false;
+  activeBlockIndex = -1;
+  updatePlayButton();
+  updateBlockSlider();
+  clearSignalPulse();
+}
+
+profileSelect.addEventListener('change', () => {
+  const key = profileSelect.value;
+  if (key && key !== currentProfileKey) {
+    stopReplay();
+    loadProfile(key);
+  }
+});
+
+function updateUI() {
+  if (!currentVizData) return;
+
+  // Refresh detail panel if a block is selected
+  if (selectedBlockName) updateDetailPanel();
+
+  // Step label
+  stepLabel.textContent = `Step ${currentTimestep}`;
+
+  // Slider position
+  stepSlider.value = parseInt(currentTimestep);
+  stepSlider.min = Math.min(...currentVizData.timesteps);
+  stepSlider.max = Math.max(...currentVizData.timesteps);
+
+  // Info panel + hero label
+  const meta = currentVizData.metadata;
+  if (meta) {
+    infoCharacter.textContent = `${meta.char || ''} / ${meta.pose || ''}`;
+    infoPrompt.textContent = meta.prompt || '';
+    // Update hero label
+    const heroLabel = document.querySelector('.tl');
+    heroLabel.innerHTML = `U-NET ARCHITECTURE / <strong>${(meta.char || '').toUpperCase()}</strong> / ${(meta.pose || '').toUpperCase()}` +
+      `<br><span style="font-size:7px;opacity:0.6;display:inline-block;max-width:60vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom;">${meta.prompt || ''}</span>`;
+  }
+
+  // Intermediate image
+  if (vizIndex) {
+    const profile = vizIndex.profiles.find(p => p.key === currentProfileKey);
+    const stripBase = (path) => path ? DATA_BASE + path.replace(/^activation-mapping\//, '') : null;
+
+    // Pick image source based on CFG view mode
+    const cfgMode = typeof cfgViewMode !== 'undefined' ? cfgViewMode : 'merged';
+    const imgKey = cfgMode === 'cond' ? 'intermediates_cond'
+                 : cfgMode === 'uncond' ? 'intermediates_uncond'
+                 : 'intermediates';
+    const cfgImgPath = profile?.images?.[imgKey]?.[currentTimestep];
+    const fallbackPath = profile?.images?.intermediates?.[currentTimestep];
+    const imgPath = cfgImgPath || fallbackPath;
+
+    if (profile?.has_intermediates && imgPath) {
+      intermediateImg.src = stripBase(imgPath);
+      intermediateImg.onload = () => { imagePanel.style.display = 'block'; };
+      intermediateImg.onerror = () => {
+        // Fall back to merged image if cond/uncond not available
+        if (imgKey !== 'intermediates' && fallbackPath) {
+          intermediateImg.src = stripBase(fallbackPath);
+        } else {
+          imagePanel.style.display = 'none';
+        }
+      };
+      const modeLabel = cfgMode !== 'merged' ? ` (${cfgMode})` : '';
+      imageCaption.textContent = `step ${currentTimestep}${modeLabel}`;
+    } else if (profile?.images?.final) {
+      intermediateImg.src = stripBase(profile.images.final);
+      intermediateImg.onload = () => { imagePanel.style.display = 'block'; };
+      intermediateImg.onerror = () => { imagePanel.style.display = 'none'; };
+      imageCaption.textContent = 'final';
+    } else {
+      imagePanel.style.display = 'none';
+    }
+  }
+
+  // Update comparison mode if active
+  if (compareActive) {
+    updateCompareImageB();
+    updateCompareColors();
+  }
+}
+
+function populateProfileSelector() {
+  if (!vizIndex) return;
+  profileSelect.innerHTML = '';
+  vizIndex.profiles.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.key;
+    opt.textContent = `${p.character} / ${p.pose}`;
+    profileSelect.appendChild(opt);
+  });
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Default grey state — shown before any profile data loads
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function setAllBlocksGrey() {
+  somaMeshes.forEach((mesh) => {
+    mesh.material.color.setHex(0x505868);
+    mesh.material.emissive.setHex(0x000000);
+    mesh.material.emissiveIntensity = 0;
+  });
+}
+
+setAllBlocksGrey();
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Init: load data, then start render loop
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async function initData() {
+  const index = await loadIndex();
+  if (index && index.profiles.length > 0) {
+    populateProfileSelector();
+    // Load first profile
+    await loadProfile(index.profiles[0].key);
+  } else {
+    console.log('No viz data available — running in aesthetic mode');
+  }
+}
+
+initData();
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Signal Pulse + Trail Rendering
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const PULSE_COLOR = new THREE.Color(0xffffff);
+const PULSE_EMISSIVE = new THREE.Color(0xe8bd73);
+const DIM_COLOR = new THREE.Color(0x3a3e48);
+const TRAIL_DEPTH = 8; // how many blocks back the warm trail extends
+
+// Smooth block transition: 0→1 float interpolating between blocks
+let blockTransition = 0;
+
+function clampReplayBlockIndex(idx) {
+  if (!Number.isFinite(idx)) return -1;
+  return Math.max(0, Math.min(Math.trunc(idx), fullSequence.length - 1));
+}
+
+function clampReplayTransition(transition = 0) {
+  if (!Number.isFinite(transition)) return 0;
+  return Math.max(0, Math.min(transition, 0.999999));
+}
+
+function setReplayCursor(blockIdx = activeBlockIndex, transition = blockTransition) {
+  activeBlockIndex = blockIdx < 0 ? -1 : clampReplayBlockIndex(blockIdx);
+  blockTransition = clampReplayTransition(transition);
+}
+
+// Store original soma scale for pulse animation
+const somaBaseScales = new Map();
+somaMeshes.forEach((mesh, name) => {
+  somaBaseScales.set(name, mesh.scale.x); // uniform scale
+});
+
+// Helper: get activation-based normalized value for a block at current timestep
+function getBlockActivation(blockName) {
+  if (!currentVizData || !currentTimestep) return 0;
+  const blockData = currentVizData.blocks[currentTimestep];
+  if (!blockData) return 0;
+  const profileName = vizToProfileName(blockName);
+  if (!profileName || !blockData[profileName]) return 0;
+  const stats = blockData[profileName];
+  const logNorm = stats.log_norm ?? Math.log1p(stats.norm ?? 0);
+  const normBounds = currentVizData.normalization.per_step[currentTimestep]
+    || currentVizData.normalization.global;
+  const range = normBounds.p95 - normBounds.p5;
+  const normalized = range > 0 ? (logNorm - normBounds.p5) / range : 0.5;
+  return Math.max(0, Math.min(1, isFinite(normalized) ? normalized : 0));
+}
+
+function applySignalPulse(t) {
+  if (activeBlockIndex < 0) return; // no replay active
+  if (compareActive) return; // don't override diff coloring
+
+  const activeBlockName = fullSequence[activeBlockIndex];
+
+  // --- Skip connection activation ---
+  skipMats.forEach(mat => {
+    mat.emissiveIntensity = 0.08;
+    mat.emissive.setHex(0x887040);
+  });
+
+  const skipRatios = currentVizData?.skip_ratios?.[currentTimestep];
+
+  fullSequence.forEach((blockName, idx) => {
+    const skipInfo = skipByDecoder.get(blockName);
+    if (!skipInfo) return;
+
+    const ratioData = skipRatios?.[blockName];
+    const ratio = ratioData?.skip_ratio ?? 0.5;
+    const ratioMul = 0.3 + 0.7 * ratio;
+
+    if (idx === activeBlockIndex) {
+      const pulse = 0.5 + 0.5 * Math.sin(t * Math.PI * 4);
+      skipInfo.mat.emissive.setHex(0xe8bd73);
+      skipInfo.mat.emissiveIntensity = (0.8 + pulse * 0.6) * ratioMul;
+    } else if (idx < activeBlockIndex) {
+      const distance = activeBlockIndex - idx;
+      if (distance <= TRAIL_DEPTH) {
+        const trailT = distance / TRAIL_DEPTH;
+        skipInfo.mat.emissive.setHex(0xc8a060);
+        skipInfo.mat.emissiveIntensity = Math.max(0.08, 0.5 * (1 - trailT) * ratioMul);
+      }
+    }
+  });
+
+  // --- Cross-attention bezier flash during replay ---
+  const isCrossAttn = CROSS_ATTN_BLOCKS.includes(activeBlockName);
+  attnLines.forEach(({ material }, vizName) => {
+    if (vizName === activeBlockName && isCrossAttn) {
+      const pulse = 0.5 + 0.5 * Math.sin(t * Math.PI * 4);
+      material.opacity = 0.75 + pulse * 0.25;
+      material.color.setHex(0xf0c050);
+    } else {
+      // Completely hide non-active cross-attn curves during replay
+      // (they span the entire scene and create phantom line artifacts)
+      material.opacity = 0.0;
+    }
+  });
+
+  // Prompt field: only visible when active block has cross-attention
+  if (isCrossAttn) {
+    const pulse = 0.5 + 0.5 * Math.sin(t * Math.PI * 4);
+    promptFieldMat.opacity = 0.5 + pulse * 0.3;
+    promptFieldMat.color.setHex(0xf0d080);
+    promptLbl.material.opacity = 0.3 + pulse * 0.15;
+  } else {
+    promptFieldMat.opacity = 0.0;
+    promptLbl.material.opacity = 0.0;
+  }
+
+  // --- Cable signal flow (per-level) ---
+  const blockInfo = blockLevelMap.get(activeBlockName);
+
+  function setTubeProgress(mat, progress, progressOffset = 0.0) {
+    const shader = mat.userData.shaderRef?.value;
+    if (!shader) return;
+    shader.uniforms.u_progress.value = progress;
+    if (shader.uniforms.u_progressOffset) shader.uniforms.u_progressOffset.value = progressOffset;
+
+    // Material emissive set to black + intensity 1.0.
+    // All signal glow is added per-fragment in the shader via totalEmissiveRadiance.
+    // emissiveIntensity must be 1.0 so the shader's contribution passes through unscaled.
+    // Black base emissive means: zero glow unless the shader explicitly adds it.
+    mat.emissive.setHex(0x000000);
+    mat.emissiveIntensity = 1.0;
+  }
+
+  function setHeadActivation(mat, activation, color, blockStart = 0.0) {
+    const shader = mat.userData.shaderRef?.value;
+    if (!shader) return;
+    if (shader.uniforms.u_headActivation) shader.uniforms.u_headActivation.value = activation;
+    if (shader.uniforms.u_headColor && color) shader.uniforms.u_headColor.value.copy(color);
+    if (shader.uniforms.u_blockStart) shader.uniforms.u_blockStart.value = blockStart;
+    // Head coloring is handled in the shader via u_headColor + u_headActivation.
+    // No material-level emissive change — would light the whole tube uniformly.
+  }
+
+  // Level-progress variables — hoisted for use by both strand and soma sections
+  const WAVE_SPREAD_BLOCKS = 0.35;
+  let localProgress = 0;
+  let waveSpreadProgress = 0;
+  let currentLevelIdx = -1;
+
+  if (blockInfo) {
+    currentLevelIdx = levelOrder.indexOf(blockInfo.levelKey);
+    // Each block gets an equal slice of tube progress (1/totalBlocks).
+    // Last block animates from (N-1)/N → 1.0 instead of starting at 1.0.
+    localProgress = (blockInfo.localIndex + blockTransition) / blockInfo.localTotal;
+
+    // Set per-level tube progress + reset head activation on non-active levels
+    // WAVE_SPREAD_BLOCKS: stagger in BLOCK units (consistent visual lag regardless of level size)
+    // Divided by localTotal to convert to level-progress fraction.
+    // 0.35 blocks ≈ "last strand lights 0.35 blocks after first strand" at any level.
+    waveSpreadProgress = WAVE_SPREAD_BLOCKS / Math.max(1, blockInfo.localTotal);
+
+    levelOrder.forEach((key, i) => {
+      const lt = levelTubes[key];
+      if (!lt) return;
+
+      if (i < currentLevelIdx) {
+        // === Bug 1+6 fix: Preceding level — smooth ramp instead of snap ===
+        // When we just crossed a level boundary (first block of new level),
+        // the previous level's trailing strands haven't finished yet.
+        // Gradually ramp their offsets to 0 so they complete smoothly.
+        const prevLevelBlocks = levelBlockNames[key]?.length || 1;
+        const prevWaveSpread = WAVE_SPREAD_BLOCKS / Math.max(1, prevLevelBlocks);
+
+        if (blockInfo.localIndex === 0 && i === currentLevelIdx - 1) {
+          // First block of new level, immediately preceding level only —
+          // ramp trailing strands to completion over first third of blockTransition
+          const rampT = Math.min(1, blockTransition * 3);
+          const residualSpread = prevWaveSpread * (1 - rampT);
+          lt.mats.forEach((m, si) => {
+            const offset = lt.mats.length > 1 ? (si / (lt.mats.length - 1)) * residualSpread : 0;
+            setTubeProgress(m, 1.0, offset);
+          });
+        } else {
+          // Fully settled (past first block, or 2+ levels behind) — no spread
+          lt.mats.forEach(m => setTubeProgress(m, 1.0, 0.0));
+        }
+
+        // === Bug 3 fix: Gradual head activation on level crossing ===
+        // Apply cached head activation from the LAST block in this level (exit state)
+        // but scale it gradually during the first block of the new level.
+        const levelBlocks = levelBlockNames[key];
+        if (levelBlocks) {
+          const lastBlock = levelBlocks[levelBlocks.length - 1];
+          const cachedNorms = currentVizData?.blocks?.[currentTimestep]?.[vizToProfileName(lastBlock)]?.head_norms;
+          if (cachedNorms && cachedNorms.length > 0) {
+            // Only ramp the IMMEDIATELY preceding level; levels further back are already settled
+            const activationScale = (blockInfo.localIndex === 0 && i === currentLevelIdx - 1)
+              ? Math.min(1, blockTransition * 3) : 1.0;
+            const minH = Math.min(...cachedNorms);
+            const maxH = Math.max(...cachedNorms);
+            const rangeH = maxH - minH;
+            lt.mats.forEach((mat, si) => {
+              if (si < cachedNorms.length) {
+                const t = rangeH > 0 ? (cachedNorms[si] - minH) / rangeH : 0.5;
+                const { color: headColor } = activationColor(t);
+                const intensity = (0.3 + t * 0.7) * activationScale;
+                setHeadActivation(mat, intensity, headColor);
+              } else {
+                setHeadActivation(mat, 0.0);
+              }
+            });
+          } else {
+            lt.mats.forEach(m => setHeadActivation(m, 0.0));
+          }
+        } else {
+          lt.mats.forEach(m => setHeadActivation(m, 0.0));
+        }
+
+      } else if (i === currentLevelIdx) {
+        // === Bug 6 fix: No clamp — pass localProgress directly ===
+        // localProgress is (localIndex + blockTransition) / localTotal, naturally in [0, 1].
+        // Removing the redundant Math.min(1, ...) ensures no precision artifacts.
+        lt.mats.forEach((m, si) => {
+          const offset = lt.mats.length > 1 ? (si / (lt.mats.length - 1)) * waveSpreadProgress : 0;
+          setTubeProgress(m, localProgress, offset);
+        });
+
+      } else {
+        // Following level: dark, reset offset
+        lt.mats.forEach(m => { setTubeProgress(m, -1.0, 0.0); setHeadActivation(m, 0.0); });
+      }
+    });
+
+    // === Transition tubes — late start with smooth handoff ===
+    // afterLevel = source level (level "after which" this tube appears).
+    // Transition starts late (92%) to avoid visual "jump ahead", but continues
+    // smoothly into the first block of the incoming level via handoff.
+    const TT_START = 0.92;  // transition tube starts when source level is 92% done
+    const TT_WINDOW = 1.0 - TT_START;  // = 0.08
+
+    transitionTubes.forEach(tt => {
+      if (!tt.mats) return;
+      const srcIdx = levelOrder.indexOf(tt.afterLevel);
+      // Wave spread: use source level's block count (consistent with level tube wave spread)
+      const srcLevelBlocks = levelBlockNames[tt.afterLevel]?.length || 1;
+      // Cap wave spread to 90% of TT_WINDOW so last strand can still activate
+      const ttWaveSpread = Math.min(WAVE_SPREAD_BLOCKS / Math.max(1, srcLevelBlocks), TT_WINDOW * 0.9);
+
+      if (srcIdx < currentLevelIdx - 1) {
+        // Both source and dest are behind current level — fully lit
+        tt.mats.forEach(m => setTubeProgress(m, 1.0, 0.0));
+
+      } else if (srcIdx === currentLevelIdx - 1) {
+        // Transition leads INTO the current level (source is one level behind)
+        if (blockInfo.localIndex === 0) {
+          // First block of current level — complete remaining transition via handoff.
+          // prevP = where each strand was at level boundary (localProgress=1.0 in source)
+          tt.mats.forEach((m, si) => {
+            const ttOffset = tt.mats.length > 1 ? (si / (tt.mats.length - 1)) * ttWaveSpread : 0;
+            const prevP = (1.0 - ttOffset - TT_START) / TT_WINDOW;
+            // Ramp from prevP to 1.0 over first 40% of blockTransition
+            const rampT = Math.min(1, blockTransition / 0.4);
+            const p = prevP + (1.0 - prevP) * rampT;
+            setTubeProgress(m, Math.max(-1, Math.min(1, p)), 0.0);
+          });
+        } else {
+          // Past first block — transition fully lit
+          tt.mats.forEach(m => setTubeProgress(m, 1.0, 0.0));
+        }
+
+      } else if (srcIdx === currentLevelIdx) {
+        // Current level is the source — animate when near end
+        if (localProgress >= TT_START) {
+          tt.mats.forEach((m, si) => {
+            const ttOffset = tt.mats.length > 1 ? (si / (tt.mats.length - 1)) * ttWaveSpread : 0;
+            const p = (localProgress - ttOffset - TT_START) / TT_WINDOW;
+            setTubeProgress(m, Math.max(-1, Math.min(1, p)), 0.0);
+          });
+        } else {
+          tt.mats.forEach(m => setTubeProgress(m, -1.0, 0.0));
+        }
+
+      } else {
+        // Source is ahead of current level — dark
+        tt.mats.forEach(m => setTubeProgress(m, -1.0, 0.0));
+      }
+    });
+
+    // --- Per-head activation coloring ---
+    // Each strand (= 1 attention head) gets colored AND intensity-scaled by its head_norms value.
+    // Hot heads are bright and warm, cold heads are dim and cool.
+    // Head color is confined to the current block's tube segment via u_blockStart shader uniform.
+    const headNorms = currentVizData?.blocks?.[currentTimestep]?.[vizToProfileName(activeBlockName)]?.head_norms;
+    const blockStartProgress = blockInfo.localIndex / blockInfo.localTotal;
+
+    if (headNorms && headNorms.length > 0) {
+      const lt = levelTubes[blockInfo.levelKey];
+      if (lt) {
+        const minH = Math.min(...headNorms);
+        const maxH = Math.max(...headNorms);
+        const rangeH = maxH - minH;
+
+        lt.mats.forEach((mat, i) => {
+          if (i < headNorms.length) {
+            const offset = lt.mats.length > 1 ? (i / (lt.mats.length - 1)) * waveSpreadProgress : 0;
+            const strandProgress = localProgress - offset;
+
+            // Gate: strand must have entered the current block's tube territory
+            if (strandProgress < blockStartProgress) {
+              setHeadActivation(mat, 0.0, null, blockStartProgress);
+              return;
+            }
+
+            const t = rangeH > 0 ? (headNorms[i] - minH) / rangeH : 0.5;
+            const { color: headColor } = activationColor(t);
+            const intensity = 0.3 + t * 0.7;
+            setHeadActivation(mat, intensity, headColor, blockStartProgress);
+          } else {
+            // Clear stale head activation on extra strands beyond headNorms array
+            setHeadActivation(mat, 0.0, null, blockStartProgress);
+          }
+        });
+      }
+    } else {
+      // Clear stale head activation when no headNorms data for this block
+      const lt = levelTubes[blockInfo.levelKey];
+      if (lt) {
+        lt.mats.forEach(mat => setHeadActivation(mat, 0.0, null, blockStartProgress));
+      }
+    }
+  }
+
+  // --- Soma block coloring: data-driven with pulse overlay ---
+  const blockData = currentVizData?.blocks?.[currentTimestep];
+  const normBounds = currentVizData?.normalization?.per_step?.[currentTimestep]
+    || currentVizData?.normalization?.global;
+  const normP5 = normBounds?.p5 ?? 0;
+  const normRange = (normBounds?.p95 ?? 1) - normP5;
+
+  fullSequence.forEach((blockName, idx) => {
+    const mesh = somaMeshes.get(blockName);
+    if (!mesh) return;
+    const baseScale = somaBaseScales.get(blockName) || 1;
+
+    // Get this block's actual activation magnitude (0→1)
+    const activation = getBlockActivation(blockName);
+    const { color: actColor, emissiveIntensity: actEmissive } = activationColor(activation);
+
+    // Scale by activation: hot blocks are visibly larger (1.0x → 1.6x)
+    const actScale = 1.0 + activation * 0.6;
+
+    // For blocks in the CURRENT level, use continuous strand progress
+    // so blocks only light after all strands have reached them.
+    const thisBlockInfo = blockLevelMap.get(blockName);
+    const inCurrentLevel = blockInfo && thisBlockInfo &&
+      thisBlockInfo.levelKey === blockInfo.levelKey;
+
+    if (inCurrentLevel) {
+      // Block position within the level tube (0→1)
+      const blockPos = thisBlockInfo.localIndex / thisBlockInfo.localTotal;
+      const blockEndPos = (thisBlockInfo.localIndex + 1) / thisBlockInfo.localTotal;
+      // Trailing strand = last strand to arrive (accounts for wave spread)
+      const trailingProgress = localProgress - waveSpreadProgress;
+
+      if (trailingProgress >= blockEndPos) {
+        // All strands have fully passed this block — visited state
+        const distance = activeBlockIndex - idx;
+        const trailT = Math.min(1, Math.max(0, distance) / TRAIL_DEPTH);
+        mesh.material.color.copy(actColor);
+        mesh.material.emissive.copy(EMISSIVE_HOT);
+        mesh.material.emissiveIntensity = actEmissive * (0.15 + 0.85 * (1 - trailT));
+        mesh.scale.setScalar(baseScale * actScale);
+
+      } else if (trailingProgress >= blockPos) {
+        // All strands have arrived — block is active, ramps up as signal passes through
+        const segmentLen = blockEndPos - blockPos;
+        const arrivalT = Math.max(0, Math.min(1, (trailingProgress - blockPos) / segmentLen));
+        const pulse = 0.5 + 0.5 * Math.sin(t * Math.PI * 4);
+
+        mesh.material.color.copy(actColor).lerp(PULSE_COLOR, (0.15 + pulse * 0.25) * arrivalT);
+        mesh.material.emissive.copy(EMISSIVE_HOT);
+        mesh.material.emissiveIntensity = (Math.max(actEmissive, 0.5) + pulse * 0.8) * arrivalT;
+        const throbAmount = 0.08 + activation * 0.15;
+        mesh.scale.setScalar(baseScale * (1.0 + (actScale - 1.0) * arrivalT) * (1.0 + pulse * throbAmount * arrivalT));
+
+      } else {
+        // Signal hasn't reached this block — dim
+        mesh.material.color.copy(DIM_COLOR);
+        mesh.material.emissive.setHex(0x000000);
+        mesh.material.emissiveIntensity = 0;
+        mesh.scale.setScalar(baseScale);
+      }
+
+    } else if (blockInfo && thisBlockInfo) {
+      // Block in a DIFFERENT level — use level comparison
+      const thisLevelIdx = levelOrder.indexOf(thisBlockInfo.levelKey);
+
+      if (thisLevelIdx >= 0 && thisLevelIdx < currentLevelIdx) {
+        // Preceding level — fully visited, trail fade by distance
+        const distance = activeBlockIndex - idx;
+        const trailT = Math.min(1, Math.max(0, distance) / TRAIL_DEPTH);
+        mesh.material.color.copy(actColor);
+        mesh.material.emissive.copy(EMISSIVE_HOT);
+        mesh.material.emissiveIntensity = actEmissive * (0.15 + 0.85 * (1 - trailT));
+        mesh.scale.setScalar(baseScale * actScale);
+
+      } else {
+        // Following level — dim
+        mesh.material.color.copy(DIM_COLOR);
+        mesh.material.emissive.setHex(0x000000);
+        mesh.material.emissiveIntensity = 0;
+        mesh.scale.setScalar(baseScale);
+      }
+
+    } else {
+      // Fallback (no blockInfo or block not in blockLevelMap)
+      if (idx < activeBlockIndex) {
+        const distance = activeBlockIndex - idx;
+        const trailT = Math.min(1, distance / TRAIL_DEPTH);
+        mesh.material.color.copy(actColor);
+        mesh.material.emissive.copy(EMISSIVE_HOT);
+        mesh.material.emissiveIntensity = actEmissive * (0.15 + 0.85 * (1 - trailT));
+        mesh.scale.setScalar(baseScale * actScale);
+      } else {
+        mesh.material.color.copy(DIM_COLOR);
+        mesh.material.emissive.setHex(0x000000);
+        mesh.material.emissiveIntensity = 0;
+        mesh.scale.setScalar(baseScale);
+      }
+    }
+  });
+}
+
+function clearSignalPulse() {
+  blockTransition = 0;
+  _lastBlockImgKey = ''; // Reset per-block image tracking
+  // Restore all blocks to their activation-colored state
+  fullSequence.forEach(blockName => {
+    const mesh = somaMeshes.get(blockName);
+    if (!mesh) return;
+    const baseScale = somaBaseScales.get(blockName) || 1;
+    mesh.scale.setScalar(baseScale);
+  });
+  // Reset skip connections to baseline
+  skipMats.forEach(mat => {
+    mat.emissive.setHex(0x887040);
+    mat.emissiveIntensity = 0.15;
+  });
+  // Reset cable signal flow on all per-strand mats (levelTubes + transitionTubes)
+  function resetStrandMat(mat) {
+    const shader = mat.userData.shaderRef?.value;
+    if (!shader) return;
+    if (shader.uniforms.u_progress) shader.uniforms.u_progress.value = -1.0;
+    if (shader.uniforms.u_progressOffset) shader.uniforms.u_progressOffset.value = 0.0;
+    if (shader.uniforms.u_headActivation) shader.uniforms.u_headActivation.value = 0.0;
+    if (shader.uniforms.u_headColor) shader.uniforms.u_headColor.value.set(0.91, 0.74, 0.45);
+    // Reset material-level emissive
+    mat.emissive.setHex(0xe8bd73);
+    mat.emissiveIntensity = 0.18;
+  }
+  Object.values(levelTubes).forEach(lt => lt.mats.forEach(resetStrandMat));
+  transitionTubes.forEach(tt => { if (tt.mats) tt.mats.forEach(resetStrandMat); });
+  // Reset prompt field to hidden resting state
+  promptFieldMat.opacity = 0.0;
+  promptFieldMat.color.setHex(0xc8a868);
+  promptLbl.material.opacity = 0.0;
+  // Reset cross-attention lines to data-driven state (all hidden by default)
+  updateCrossAttention();
+  updateBlockColors();
+}
+
+/**
+ * Update the intermediate image panel to show per-block or per-sub-block
+ * PCA activation image during replay, falling back to per-timestep images.
+ *
+ * blockName can be a canonical block ('input_blocks.4.1') or a sub-block
+ * name ('input_blocks.4.1::sub02_self_attn_0'). Sub-block names use '::'
+ * as separator; in filenames this becomes '__'.
+ */
+let _lastBlockImgKey = '';
+function updateBlockImage(blockName) {
+  if (!vizIndex || !currentProfileKey || !currentTimestep) return;
+
+  const profile = vizIndex.profiles.find(p => p.key === currentProfileKey);
+  if (!profile) return;
+
+  const step = parseInt(currentTimestep);
+  const imgKey = `${blockName}_${step}`;
+
+  // Skip if already showing this image
+  if (imgKey === _lastBlockImgKey) return;
+  _lastBlockImgKey = imgKey;
+
+  const stripBase = (path) => path ? DATA_BASE + path.replace(/^activation-mapping\//, '') : null;
+
+  // Determine parent block and sub-op name for caption
+  const isSubBlock = blockName.includes('::');
+  let parentBlockName, subOpName, pcaBlockName;
+  if (isSubBlock) {
+    [parentBlockName, subOpName] = blockName.split('::');
+    // Strip the 'sub##_' prefix for display: 'sub02_self_attn_0' → 'self_attn_0'
+    subOpName = subOpName.replace(/^sub\d+_/, '');
+    pcaBlockName = blockName; // sub-blocks already use profile names
+  } else {
+    // Map viz aliases to profile names for correct PCA filename lookup
+    parentBlockName = vizToProfileName(blockName) || blockName;
+    pcaBlockName = parentBlockName;
+    subOpName = null;
+  }
+
+  // Try PCA per-block image first
+  if (profile.has_pca && profile.images.pca_base && profile.images.pca_pattern) {
+    // Sanitize: '.' → '_', '::' → '__'
+    const safeName = pcaBlockName.replace(/::/g, '__').replace(/\./g, '_');
+    const pcaFile = profile.images.pca_pattern
+      .replace('{block}', safeName)
+      .replace('{step:02d}', String(step).padStart(2, '0'));
+    const pcaPath = stripBase(profile.images.pca_base + pcaFile);
+
+    intermediateImg.src = pcaPath;
+    intermediateImg.onload = () => { imagePanel.style.display = 'block'; };
+    intermediateImg.onerror = () => {
+      // Fall back to per-timestep intermediate image
+      const tsPath = profile.images?.intermediates?.[currentTimestep];
+      if (tsPath) {
+        intermediateImg.src = stripBase(tsPath);
+        intermediateImg.onload = () => { imagePanel.style.display = 'block'; };
+        intermediateImg.onerror = () => { imagePanel.style.display = 'none'; };
+      }
+    };
+
+    // Build caption
+    const shortName = parentBlockName.split('.').slice(-2).join('.');
+    const blockDef = blocks.find(b => b.name === parentBlockName);
+    const chLabel = blockDef ? ` — ${blockDef.ch}ch` : '';
+    if (subOpName) {
+      imageCaption.textContent = `step ${step} — ${shortName} — ${subOpName}${chLabel}`;
+    } else {
+      imageCaption.textContent = `step ${step} — ${shortName}${chLabel}`;
+    }
+  } else {
+    // No PCA data — show per-timestep image
+    const tsPath = profile.images?.intermediates?.[currentTimestep];
+    if (tsPath) {
+      intermediateImg.src = stripBase(tsPath);
+      intermediateImg.onload = () => { imagePanel.style.display = 'block'; };
+      intermediateImg.onerror = () => { imagePanel.style.display = 'none'; };
+      const shortName = parentBlockName.split('.').slice(-2).join('.');
+      const blockDef = blocks.find(b => b.name === parentBlockName);
+      const chLabel = blockDef ? ` — ${blockDef.ch}ch` : '';
+      imageCaption.textContent = `step ${step} — ${shortName}${chLabel}`;
+    }
+  }
+
+  // Draw head_norms bar chart (uses parent block for data lookup)
+  drawHeadNormsChart(parentBlockName);
+}
+
+function drawHeadNormsChart(blockName) {
+  const profileName = vizToProfileName(blockName);
+  const headNorms = currentVizData?.blocks?.[currentTimestep]?.[profileName]?.head_norms;
+  if (!headNorms || headNorms.length === 0) {
+    headNormsChart.style.display = 'none';
+    return;
+  }
+
+  const ctx = headNormsChart.getContext('2d');
+  const w = headNormsChart.width;
+  const h = headNormsChart.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const minV = Math.min(...headNorms);
+  const maxV = Math.max(...headNorms);
+  const range = maxV - minV || 1;
+
+  const barW = Math.max(2, (w - 4) / headNorms.length - 1);
+  const gap = 1;
+  const startX = (w - (barW + gap) * headNorms.length + gap) / 2;
+
+  headNorms.forEach((v, i) => {
+    const t = (v - minV) / range;
+    const barH = Math.max(2, t * (h - 4));
+    const x = startX + i * (barW + gap);
+    const y = h - 2 - barH;
+
+    // Color ramp: cold blue → hot red
+    const r = Math.floor(t * 255);
+    const g = Math.floor((1 - Math.abs(t - 0.5) * 2) * 180);
+    const b = Math.floor((1 - t) * 255);
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(x, y, barW, barH);
+  });
+
+  headNormsChart.style.display = 'block';
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Play Loop — auto-advances signal through blocks or steps
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function advancePlay(t) {
+  if (!isPlaying || !currentVizData) return;
+
+  const elapsed = t - lastPlayTime;
+
+  if (playMode === 'block') {
+    // Smooth block advance: blockTransition ramps 0→1 per block, then snaps to next
+    const transitionSpeed = playSpeed * 1.5; // blocks per second (smooth)
+    blockTransition += elapsed * transitionSpeed;
+    lastPlayTime = t;
+
+    while (blockTransition >= 1.0) {
+      const carryTransition = blockTransition - 1.0;
+      const prevLevelKey = blockLevelMap.get(fullSequence[activeBlockIndex])?.levelKey;
+      activeBlockIndex++;
+      if (activeBlockIndex >= fullSequence.length) {
+        // Reached end of step — advance to next diffusion step
+        const steps = currentVizData.timesteps;
+        const currentIdx = steps.indexOf(parseInt(currentTimestep));
+        if (currentIdx < steps.length - 1) {
+          currentTimestep = String(steps[currentIdx + 1]);
+          updateBlockColors();
+          updateCrossAttention();
+          updateUI();
+          setReplayCursor(0, 0);
+          updateBlockImage(fullSequence[0]);
+        } else {
+          // Replay finished: clamp to last block so applySignalPulse still has valid blockInfo
+          setReplayCursor(fullSequence.length - 1, 0);
+          isPlaying = false;
+          updatePlayButton();
+          break; // exit while loop — replay is done
+        }
+      } else {
+        blockTransition = carryTransition;
+      }
+      // Update per-block image on block change (skip if sub-blocks will handle it)
+      if (activeBlockIndex >= 0 && activeBlockIndex < fullSequence.length) {
+        const _vizName = fullSequence[activeBlockIndex];
+        const _profName = vizToProfileName(_vizName);
+        const _hasSubs = currentVizData.sub_blocks?.[_profName]?.length > 0;
+        if (!_hasSubs) {
+          updateBlockImage(_vizName);
+        }
+      }
+      updateBlockSlider();
+      // Break at level boundaries so applySignalPulse sees the first block of new level cleanly
+      const newLevelKey = blockLevelMap.get(fullSequence[activeBlockIndex])?.levelKey;
+      if (newLevelKey !== prevLevelKey) break;
+    }
+    // Safety: ensure blockTransition stays in [0, 1) after boundary breaks
+    if (blockTransition >= 1.0) blockTransition = blockTransition % 1.0;
+
+    // Sub-block image cycling: during smooth 0→1 transition within a block,
+    // cycle through sub-block PCA images proportionally.
+    // blockTransition 0→1 maps to subBlocks[0] through subBlocks[N-1].
+    if (activeBlockIndex >= 0 && activeBlockIndex < fullSequence.length && currentVizData.sub_blocks) {
+      const vizBlockName = fullSequence[activeBlockIndex];
+      const profileName = vizToProfileName(vizBlockName);
+      const subBlocks = currentVizData.sub_blocks[profileName];
+      if (subBlocks && subBlocks.length > 0) {
+        const subIdx = Math.min(
+          Math.floor(blockTransition * subBlocks.length),
+          subBlocks.length - 1
+        );
+        updateBlockImage(subBlocks[subIdx]);
+      }
+    }
+  } else if (playMode === 'step') {
+    const interval = 1.0 / playSpeed;
+    if (elapsed >= interval) {
+      lastPlayTime = t;
+      const steps = currentVizData.timesteps;
+      const currentIdx = steps.indexOf(parseInt(currentTimestep));
+      if (currentIdx < steps.length - 1) {
+        currentTimestep = String(steps[currentIdx + 1]);
+        updateBlockColors();
+        updateCrossAttention();
+        updateUI();
+      } else {
+        isPlaying = false;
+        updatePlayButton();
+      }
+    }
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Phase 4: Raycaster + Block Selection + Click Detection
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+let selectedBlockName = null;
+
+// Build reverse map: mesh → block name
+const meshToBlock = new Map();
+somaMeshes.forEach((mesh, name) => { meshToBlock.set(mesh, name); });
+
+// Drag detection — only fire click on static pointer (no orbit drag)
+let pointerDownPos = null;
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  pointerDownPos = { x: e.clientX, y: e.clientY };
+});
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (!pointerDownPos) return;
+  const dx = Math.abs(e.clientX - pointerDownPos.x);
+  const dy = Math.abs(e.clientY - pointerDownPos.y);
+  if (dx < 4 && dy < 4) {
+    handleSceneClick(e);
+  }
+  pointerDownPos = null;
+});
+
+function handleSceneClick(event) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+
+  const somaArray = Array.from(somaMeshes.values());
+  const intersects = raycaster.intersectObjects(somaArray);
+
+  if (intersects.length > 0) {
+    const hitMesh = intersects[0].object;
+    const blockName = meshToBlock.get(hitMesh);
+    if (blockName) {
+      selectBlock(blockName);
+    }
+  } else {
+    deselectBlock();
+  }
+}
+
+// Expose raycaster + click internals for debug
+window._vizDebug.raycaster = raycaster;
+window._vizDebug.meshToBlock = meshToBlock;
+// Phase 5 will add: interventionQueue, compareActive via late binding
+
+function selectBlock(blockName) {
+  selectedBlockName = blockName;
+  updateDetailPanel();
+  document.getElementById('block-detail-panel').style.display = 'block';
+  if (typeof updateInterventionChannels === 'function') updateInterventionChannels();
+  // Phase B: 3D block expansion
+  if (typeof expandBlock === 'function') expandBlock(blockName);
+  // Phase E: PCA brain scan
+  if (typeof showPcaBrainScan === 'function') showPcaBrainScan(blockName);
+}
+
+function deselectBlock() {
+  // Phase B: collapse 3D expansion
+  if (typeof collapseBlock === 'function') collapseBlock();
+  // Phase E: hide PCA brain scan
+  if (typeof hidePcaBrainScan === 'function') hidePcaBrainScan();
+  selectedBlockName = null;
+  document.getElementById('block-detail-panel').style.display = 'none';
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Phase 4: Block Detail Panel
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function updateDetailPanel() {
+  if (!selectedBlockName) return;
+
+  const block = blocks.find(b => b.name === selectedBlockName);
+  if (!block) return;
+
+  document.getElementById('detail-block-name').textContent = selectedBlockName;
+  document.getElementById('detail-type').textContent = block.label;
+  document.getElementById('detail-channels').textContent = `${block.ch}ch \u00b7 ${block.res}`;
+
+  // Stats section
+  const statsEl = document.getElementById('detail-stats');
+  const profileName = vizToProfileName(selectedBlockName);
+  const blockData = currentVizData?.blocks?.[currentTimestep];
+  const stats = profileName && blockData ? blockData[profileName] : null;
+
+  if (stats) {
+    const normBounds = currentVizData.normalization.per_step[currentTimestep]
+      || currentVizData.normalization.global;
+    const logNorm = stats.log_norm ?? Math.log1p(stats.norm ?? 0);
+    const normalized = (normBounds.p95 - normBounds.p5) > 0
+      ? (logNorm - normBounds.p5) / (normBounds.p95 - normBounds.p5) : 0.5;
+    const clamped = Math.max(0, Math.min(1, isFinite(normalized) ? normalized : 0));
+
+    const fmt = (v, d) => (typeof v === 'number' && isFinite(v)) ? v.toFixed(d) : '\u2014';
+    let html = `
+      <div class="detail-section-label">ACTIVATION \u00b7 STEP ${currentTimestep}</div>
+      <div class="detail-stat-row"><span>Norm</span><span class="detail-stat-value">${fmt(stats.norm, 1)} (${(clamped * 100).toFixed(0)}%)</span></div>
+      <div class="detail-stat-row"><span>Mean</span><span class="detail-stat-value">${fmt(stats.mean, 4)}</span></div>
+      <div class="detail-stat-row"><span>Std</span><span class="detail-stat-value">${fmt(stats.std, 4)}</span></div>
+      <div class="detail-stat-row"><span>Max</span><span class="detail-stat-value">${fmt(stats.max, 3)}</span></div>
+    `;
+    // Phase A: Residual magnitude
+    if (stats.residual_magnitude != null) {
+      const rm = stats.residual_magnitude;
+      const rmLabel = rm < 0.1 ? 'pass-through' : rm > 0.5 ? 'heavy' : 'moderate';
+      html += `<div class="detail-stat-row"><span>Residual</span><span class="detail-stat-value">${fmt(rm, 3)} (${rmLabel})</span></div>`;
+    }
+    // Phase A: CFG split
+    if (stats.cond_norm != null) {
+      html += `
+        <div class="detail-section-label" style="margin-top:6px;">CFG SPLIT</div>
+        <div class="detail-stat-row"><span>Cond</span><span class="detail-stat-value">${fmt(stats.cond_norm, 1)}</span></div>
+        <div class="detail-stat-row"><span>Uncond</span><span class="detail-stat-value">${fmt(stats.uncond_norm, 1)}</span></div>
+        <div class="detail-stat-row"><span>Divergence</span><span class="detail-stat-value">${fmt(stats.cfg_divergence, 1)}</span></div>
+      `;
+    }
+    // Phase A: Skip ratio (look up from top-level skip_ratios)
+    const skipData = currentVizData?.skip_ratios?.[currentTimestep];
+    if (skipData) {
+      // Skip ratios are keyed by wrapper name (e.g., "output_blocks.0")
+      const wrapperName = profileName?.split('.').slice(0, 2).join('.');
+      const skipStats = skipData[wrapperName];
+      if (skipStats) {
+        html += `
+          <div class="detail-section-label" style="margin-top:6px;">SKIP MIXING</div>
+          <div class="detail-stat-row"><span>Skip ratio</span><span class="detail-stat-value">${fmt(skipStats.skip_ratio, 3)}</span></div>
+          <div class="detail-stat-row"><span>Main norm</span><span class="detail-stat-value">${fmt(skipStats.main_norm, 1)}</span></div>
+          <div class="detail-stat-row"><span>Skip norm</span><span class="detail-stat-value">${fmt(skipStats.skip_norm, 1)}</span></div>
+        `;
+      }
+    }
+    statsEl.innerHTML = html;
+  } else {
+    statsEl.innerHTML = `<div class="detail-section-label">ACTIVATION</div>
+      <div style="font-size:8px;color:rgba(0,0,0,0.25);">No data for this block</div>`;
+  }
+
+  // Cross-attention
+  const crossEl = document.getElementById('detail-cross-attn');
+  const hasCrossAttn = CROSS_ATTN_BLOCKS.includes(selectedBlockName);
+  if (hasCrossAttn) {
+    const attnData = currentVizData?.attn_summaries?.[currentTimestep];
+    const attnStats = attnData ? attnData[profileName] : null;
+    const norm = attnStats?.output_norm;
+    crossEl.innerHTML = `<span class="cross-attn-active">\u2737 Cross-attention active</span>` +
+      (norm != null ? `<br>Output norm: ${norm.toFixed(1)}` : '');
+  } else {
+    crossEl.innerHTML = `<span style="color:rgba(0,0,0,0.2);">No cross-attention</span>`;
+  }
+
+  // Channel groups
+  updateChannelGroups();
+
+  // Annotations for this block
+  updateDetailAnnotations();
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Phase 4: Channel Group Display (Progressive Disclosure)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const fullProfileCache = new Map(); // profileKey → full profile data
+const fullProfileFailed = new Set(); // negative cache for failed loads
+let fullProfileAbort = null; // current AbortController
+let fullProfileAbortKey = null; // key of in-flight fetch
+const FULL_PROFILE_CACHE_MAX = 4;
+
+async function loadFullProfile(profileKey) {
+  if (fullProfileCache.has(profileKey)) {
+    // LRU refresh: delete and re-set to move to end of Map iteration order
+    const data = fullProfileCache.get(profileKey);
+    fullProfileCache.delete(profileKey);
+    fullProfileCache.set(profileKey, data);
+    return data;
+  }
+  if (fullProfileFailed.has(profileKey)) return null;
+
+  // If already fetching the same key, don't duplicate — return a promise that waits for it
+  if (fullProfileAbort && fullProfileAbortKey === profileKey) {
+    return new Promise(resolve => {
+      const check = () => {
+        if (fullProfileCache.has(profileKey)) resolve(fullProfileCache.get(profileKey));
+        else if (fullProfileFailed.has(profileKey) || !fullProfileAbort) resolve(null);
+        else setTimeout(check, 100);
+      };
+      check();
+    });
+  }
+
+  // Cancel any in-flight fetch for a different profile
+  if (fullProfileAbort) { fullProfileAbort.abort(); fullProfileAbort = null; }
+
+  const controller = new AbortController();
+  fullProfileAbort = controller;
+  fullProfileAbortKey = profileKey;
+
+  const baseName = 'baseline_' + profileKey;
+  const url = DATA_BASE + `profiles/${baseName}.json`;
+
+  try {
+    const resp = await fetch(url, { signal: controller.signal });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+
+    // LRU eviction — keep cache bounded
+    if (fullProfileCache.size >= FULL_PROFILE_CACHE_MAX) {
+      const oldest = fullProfileCache.keys().next().value;
+      fullProfileCache.delete(oldest);
+    }
+    fullProfileCache.set(profileKey, data);
+    return data;
+  } catch (e) {
+    if (e.name === 'AbortError') return null; // cancelled, not a failure
+    console.warn('Could not load full profile:', e.message);
+    fullProfileFailed.add(profileKey);
+    return null;
+  } finally {
+    if (fullProfileAbort === controller) { fullProfileAbort = null; fullProfileAbortKey = null; }
+  }
+}
+
+const CHANNEL_GROUP_SIZE = 32;
+
+function updateChannelGroups() {
+  const container = document.getElementById('channel-groups');
+  const section = document.getElementById('detail-channel-section');
+  const detailRow = document.getElementById('channel-detail-row');
+
+  if (!selectedBlockName || !currentProfileKey || !currentTimestep) {
+    section.style.display = 'none';
+    return;
+  }
+
+  const profileName = vizToProfileName(selectedBlockName);
+  if (!profileName) {
+    section.style.display = 'none';
+    return;
+  }
+
+  const block = blocks.find(b => b.name === selectedBlockName);
+  if (!block) { section.style.display = 'none'; return; }
+
+  // Try to get channel data from full profile
+  const fullProfile = fullProfileCache.get(currentProfileKey);
+  const channelNorms = fullProfile?.[currentTimestep]?.[profileName]?.channel_norms;
+
+  if (!channelNorms) {
+    // No channel data — show placeholder and trigger load
+    section.style.display = 'block';
+    const numGroups = Math.ceil(block.ch / CHANNEL_GROUP_SIZE);
+    container.innerHTML = Array(numGroups).fill(0).map(() =>
+      `<div class="ch-group-cell" style="background:rgba(0,0,0,0.08);"></div>`
+    ).join('');
+    detailRow.textContent = 'Loading channel data...';
+
+    // Trigger background load (with stale-check on completion)
+    const loadKey = currentProfileKey;
+    loadFullProfile(loadKey).then(() => {
+      if (currentProfileKey === loadKey && selectedBlockName) updateChannelGroups();
+    });
+    return;
+  }
+
+  // Compute channel group aggregates
+  section.style.display = 'block';
+  const numChannels = channelNorms.length;
+  const numGroups = Math.ceil(numChannels / CHANNEL_GROUP_SIZE);
+  const groupNorms = [];
+
+  for (let g = 0; g < numGroups; g++) {
+    const start = g * CHANNEL_GROUP_SIZE;
+    const end = Math.min(start + CHANNEL_GROUP_SIZE, numChannels);
+    let sum = 0;
+    for (let i = start; i < end; i++) sum += channelNorms[i];
+    groupNorms.push(sum / (end - start));
+  }
+
+  // Normalize group norms for coloring
+  const minN = Math.min(...groupNorms);
+  const maxN = Math.max(...groupNorms);
+  const rangeN = maxN - minN;
+
+  container.innerHTML = groupNorms.map((norm, g) => {
+    const t = rangeN > 0 ? (norm - minN) / rangeN : 0.5;
+    const r = Math.round(80 + t * (232 - 80));
+    const green = Math.round(88 + t * (189 - 88));
+    const b = Math.round(104 + t * (115 - 104));
+    const start = g * CHANNEL_GROUP_SIZE;
+    const end = Math.min(start + CHANNEL_GROUP_SIZE, numChannels);
+    return `<div class="ch-group-cell" data-group="${g}"
+      style="background:rgb(${r},${green},${b});"
+      title="ch ${start}-${end - 1}: ${norm.toFixed(1)}"></div>`;
+  }).join('');
+
+  detailRow.textContent = `${numGroups} groups \u00d7 ${CHANNEL_GROUP_SIZE}ch`;
+
+  // Click on channel group to show detail
+  container.querySelectorAll('.ch-group-cell').forEach(cell => {
+    cell.addEventListener('click', () => {
+      const g = parseInt(cell.dataset.group);
+      const start = g * CHANNEL_GROUP_SIZE;
+      const end = Math.min(start + CHANNEL_GROUP_SIZE, numChannels);
+      const groupData = channelNorms.slice(start, end);
+      const maxCh = Math.max(...groupData);
+      const minCh = Math.min(...groupData);
+      const topIdx = groupData.indexOf(maxCh);
+      detailRow.textContent = `ch ${start}-${end - 1}: avg ${(groupData.reduce((a, b) => a + b, 0) / groupData.length).toFixed(1)}, peak ch${start + topIdx} (${maxCh.toFixed(1)})`;
+    });
+  });
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Phase B: 3D Block Expansion (Progressive Disclosure Level 1)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Block type → channel group configuration
+// Cross-attention blocks: groups = attention heads (channels / 64)
+// ResBlocks: groups = GroupNorm groups (always 32)
+// Downsample/Upsample: atomic (no sub-groups)
+const CHANNEL_GROUP_CONFIGS = {
+  // channel_count → { groups, channels_per_group, type }
+  getConfig(block) {
+    const isCrossAttn = CROSS_ATTN_BLOCKS.includes(block.name);
+    if (block.isSample) return null; // downsample/upsample: atomic
+    if (isCrossAttn) {
+      const heads = Math.floor(block.ch / 64);
+      return { groups: heads, chPerGroup: 64, type: 'attention_head' };
+    }
+    // ResBlock: 32 GN groups
+    return { groups: 32, chPerGroup: Math.floor(block.ch / 32), type: 'gn_group' };
+  }
+};
+
+let expandedBlock = null; // { name, instancedMesh, config, origOpacity, origScale }
+const EXPANSION_SCALE = 1.5;
+const SUB_NODE_RADIUS = 0.035;
+const subNodeGeo = new THREE.SphereGeometry(SUB_NODE_RADIUS, 8, 6);
+
+function expandBlock(blockName) {
+  // Collapse any existing expansion first
+  collapseBlock();
+
+  const block = blocks.find(b => b.name === blockName);
+  if (!block) return;
+
+  const config = CHANNEL_GROUP_CONFIGS.getConfig(block);
+  if (!config) return; // atomic blocks don't expand
+
+  const somaMesh = somaMeshes.get(blockName);
+  if (!somaMesh) return;
+
+  const numGroups = config.groups;
+  const pos = block.pos.clone();
+  const somaRadius = (R[block.level] || R[2]) * 3.0;
+
+  // Create InstancedMesh for sub-nodes
+  // White base color so instance colors show through unmuted
+  const subMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.55,
+    metalness: 0.08,
+    emissive: 0x000000,
+    emissiveIntensity: 0.0,
+  });
+
+  const instancedMesh = new THREE.InstancedMesh(subNodeGeo, subMat, numGroups);
+  const dummy = new THREE.Object3D();
+  const ringRadius = somaRadius * EXPANSION_SCALE * 1.3;
+
+  // Layout: ring around the soma (for <= 20 groups) or concentric rings (for 32 groups)
+  if (numGroups <= 20) {
+    // Single ring
+    for (let i = 0; i < numGroups; i++) {
+      const angle = (i / numGroups) * Math.PI * 2;
+      dummy.position.set(
+        pos.x + Math.cos(angle) * ringRadius,
+        pos.y + Math.sin(angle) * ringRadius,
+        pos.z
+      );
+      dummy.scale.setScalar(1.0);
+      dummy.updateMatrix();
+      instancedMesh.setMatrixAt(i, dummy.matrix);
+    }
+  } else {
+    // Dual ring for 32 GN groups (16 inner, 16 outer)
+    const innerCount = Math.ceil(numGroups / 2);
+    const outerCount = numGroups - innerCount;
+    for (let i = 0; i < innerCount; i++) {
+      const angle = (i / innerCount) * Math.PI * 2;
+      dummy.position.set(
+        pos.x + Math.cos(angle) * ringRadius * 0.75,
+        pos.y + Math.sin(angle) * ringRadius * 0.75,
+        pos.z
+      );
+      dummy.scale.setScalar(0.8);
+      dummy.updateMatrix();
+      instancedMesh.setMatrixAt(i, dummy.matrix);
+    }
+    for (let i = 0; i < outerCount; i++) {
+      const angle = (i / outerCount) * Math.PI * 2 + Math.PI / outerCount; // offset
+      dummy.position.set(
+        pos.x + Math.cos(angle) * ringRadius * 1.15,
+        pos.y + Math.sin(angle) * ringRadius * 1.15,
+        pos.z
+      );
+      dummy.scale.setScalar(0.8);
+      dummy.updateMatrix();
+      instancedMesh.setMatrixAt(innerCount + i, dummy.matrix);
+    }
+  }
+
+  instancedMesh.instanceMatrix.needsUpdate = true;
+
+  // Set instance colors (neutral grey initially, will be updated with data)
+  instancedMesh.instanceColor = new THREE.InstancedBufferAttribute(
+    new Float32Array(numGroups * 3), 3
+  );
+  const neutralColor = new THREE.Color(0x505868);
+  for (let i = 0; i < numGroups; i++) {
+    instancedMesh.setColorAt(i, neutralColor);
+  }
+  instancedMesh.instanceColor.needsUpdate = true;
+
+  group.add(instancedMesh);
+
+  // Fade soma to translucent and scale up
+  const origOpacity = somaMesh.material.opacity;
+  const origScale = somaMesh.scale.x;
+  somaMesh.material.transparent = true;
+  somaMesh.material.opacity = 0.25;
+  somaMesh.scale.setScalar(origScale * EXPANSION_SCALE);
+
+  expandedBlock = {
+    name: blockName,
+    instancedMesh,
+    config,
+    subMat,
+    origOpacity,
+    origScale,
+    numGroups,
+  };
+
+  // Color sub-nodes with activation data
+  updateExpansionColors();
+
+  // Smooth camera focus on the expanded block
+  animateCameraToBlock(block);
+}
+
+function collapseBlock() {
+  if (!expandedBlock) return;
+
+  // Remove instanced mesh
+  group.remove(expandedBlock.instancedMesh);
+  expandedBlock.instancedMesh.dispose();
+  expandedBlock.subMat.dispose();
+
+  // Restore soma
+  const somaMesh = somaMeshes.get(expandedBlock.name);
+  if (somaMesh) {
+    somaMesh.material.opacity = expandedBlock.origOpacity;
+    somaMesh.material.transparent = expandedBlock.origOpacity < 1.0;
+    somaMesh.scale.setScalar(expandedBlock.origScale);
+  }
+
+  expandedBlock = null;
+}
+
+function updateExpansionColors() {
+  if (!expandedBlock || !currentProfileKey || !currentTimestep) return;
+
+  const fullProfile = fullProfileCache.get(currentProfileKey);
+  const profileName = vizToProfileName(expandedBlock.name);
+  const channelNorms = fullProfile?.[currentTimestep]?.[profileName]?.channel_norms;
+
+  if (!channelNorms) {
+    // Trigger load, will re-color when available
+    loadFullProfile(currentProfileKey).then(() => updateExpansionColors());
+    return;
+  }
+
+  const config = expandedBlock.config;
+  const numGroups = expandedBlock.numGroups;
+
+  // Compute per-group mean activation
+  const groupMeans = [];
+  for (let g = 0; g < numGroups; g++) {
+    const start = g * config.chPerGroup;
+    const end = Math.min(start + config.chPerGroup, channelNorms.length);
+    let sum = 0;
+    for (let i = start; i < end; i++) sum += channelNorms[i];
+    groupMeans.push(sum / (end - start));
+  }
+
+  // Normalize for coloring
+  const minN = Math.min(...groupMeans);
+  const maxN = Math.max(...groupMeans);
+  const rangeN = maxN - minN;
+
+  const color = new THREE.Color();
+  for (let g = 0; g < numGroups; g++) {
+    const t = rangeN > 0 ? (groupMeans[g] - minN) / rangeN : 0.5;
+    const { color: ac, emissiveIntensity } = activationColor(t);
+    expandedBlock.instancedMesh.setColorAt(g, ac);
+  }
+  expandedBlock.instancedMesh.instanceColor.needsUpdate = true;
+}
+
+// Camera animation for zoom-to-block
+let cameraAnimTarget = null;
+let cameraAnimStart = null;
+let cameraAnimDuration = 600; // ms
+let cameraAnimStartPos = null;
+let cameraAnimStartTarget = null;
+
+function animateCameraToBlock(block) {
+  const somaRadius = (R[block.level] || R[2]) * 3.0;
+  const viewDist = somaRadius * EXPANSION_SCALE * 8;
+
+  cameraAnimStartPos = camera.position.clone();
+  cameraAnimStartTarget = controls.target.clone();
+  cameraAnimTarget = {
+    position: new THREE.Vector3(
+      block.pos.x,
+      block.pos.y,
+      block.pos.z + viewDist
+    ),
+    target: block.pos.clone(),
+  };
+  cameraAnimStart = performance.now();
+}
+
+function updateCameraAnimation(now) {
+  if (!cameraAnimTarget || !cameraAnimStart) return;
+
+  const elapsed = now - cameraAnimStart;
+  const t = Math.min(1, elapsed / cameraAnimDuration);
+  const eased = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; // ease in-out cubic
+
+  camera.position.lerpVectors(cameraAnimStartPos, cameraAnimTarget.position, eased);
+  controls.target.lerpVectors(cameraAnimStartTarget, cameraAnimTarget.target, eased);
+  controls.update();
+
+  if (t >= 1) {
+    cameraAnimTarget = null;
+    cameraAnimStart = null;
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Phase E: PCA Brain Scan Image Display
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const pcaTextureCache = new Map();  // "profileKey/block_step" → THREE.Texture
+let pcaSprite = null;  // current displayed PCA sprite
+
+function getPcaImageUrl(profileKey, blockName, step) {
+  const profileData = vizIndex?.profiles?.find(p => p.key === profileKey);
+  if (!profileData?.has_pca) return null;
+  const safeName = blockName.replace(/\./g, '_');
+  const stepNum = parseInt(step);
+  return `activation-mapping/images/pca/${profileKey}/pca_${safeName}_step${stepNum.toString().padStart(2, '0')}.png`;
+}
+
+function showPcaBrainScan(blockName) {
+  hidePcaBrainScan();  // clean up previous
+  if (!currentProfileKey || !currentTimestep) return;
+
+  const url = getPcaImageUrl(currentProfileKey, blockName, currentTimestep);
+  if (!url) return;
+
+  const cacheKey = `${currentProfileKey}/${blockName}_${currentTimestep}`;
+  const cached = pcaTextureCache.get(cacheKey);
+
+  if (cached) {
+    _displayPcaSprite(cached, blockName);
+  } else {
+    // Lazy load with texture loader
+    const loader = new THREE.TextureLoader();
+    loader.load(url, (texture) => {
+      texture.minFilter = THREE.LinearFilter;
+      texture.magFilter = THREE.LinearFilter;
+      pcaTextureCache.set(cacheKey, texture);
+      // Only display if same block is still selected
+      if (selectedBlockName === blockName) {
+        _displayPcaSprite(texture, blockName);
+      }
+    }, undefined, () => {
+      // Load failed — PCA image doesn't exist yet, silently ignore
+    });
+  }
+}
+
+function _displayPcaSprite(texture, blockName) {
+  hidePcaBrainScan();
+  const blockPos = posMap.get(blockName);
+  if (!blockPos) return;
+
+  const block = blocks.find(b => b.name === blockName);
+  const level = block?.level || 2;
+  const size = R[level] * 6;  // scale relative to block size
+
+  const mat = new THREE.SpriteMaterial({
+    map: texture,
+    transparent: true,
+    opacity: 0.9,
+    depthTest: false,
+  });
+  pcaSprite = new THREE.Sprite(mat);
+  pcaSprite.scale.set(size, size * (texture.image.height / texture.image.width), 1);
+  // Position: offset to the left of encoder blocks, right of decoder blocks
+  const xOffset = blockPos.x < 0 ? -size * 0.8 : size * 0.8;
+  pcaSprite.position.set(blockPos.x + xOffset, blockPos.y, blockPos.z + 1.5);
+  pcaSprite.renderOrder = 998;
+  group.add(pcaSprite);
+}
+
+function hidePcaBrainScan() {
+  if (pcaSprite) {
+    group.remove(pcaSprite);
+    pcaSprite.material.dispose();
+    pcaSprite = null;
+  }
+}
+
+function updatePcaBrainScan() {
+  if (selectedBlockName) {
+    showPcaBrainScan(selectedBlockName);
+  } else {
+    hidePcaBrainScan();
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Phase 4: Annotation Store (localStorage)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const ANNOTATION_KEY = 'unet-viz-annotations';
+let annIdCounter = 0; // collision-safe counter
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function loadAnnotations() {
+  try {
+    const raw = localStorage.getItem(ANNOTATION_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch { return []; }
+}
+
+function saveAnnotations(annotations) {
+  try {
+    localStorage.setItem(ANNOTATION_KEY, JSON.stringify(annotations));
+  } catch (e) {
+    console.warn('Failed to save annotations:', e.message);
+  }
+  updateAnnotationCount();
+  updateAnnotationMarkers();
+}
+
+function addAnnotation(block, timestep, profile, note, tags) {
+  const annotations = loadAnnotations();
+  annotations.push({
+    id: 'ann_' + Date.now() + '_' + (annIdCounter++),
+    block,
+    timestep,
+    profile,
+    note,
+    tags,
+    created: new Date().toISOString(),
+  });
+  saveAnnotations(annotations);
+  return annotations;
+}
+
+function deleteAnnotation(id) {
+  const annotations = loadAnnotations().filter(a => a.id !== id);
+  saveAnnotations(annotations);
+  return annotations;
+}
+
+function getBlockAnnotations(blockName) {
+  return loadAnnotations().filter(a => a.block === blockName);
+}
+
+function updateAnnotationCount() {
+  const count = loadAnnotations().length;
+  document.getElementById('annotation-list-toggle').textContent = `Notes (${count})`;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Phase 4: Annotation Markers (3D indicators on annotated blocks)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const annotationRings = new Map(); // blockName → ring mesh
+
+function updateAnnotationMarkers() {
+  const annotations = loadAnnotations();
+  const annotatedBlocks = new Set(annotations.map(a => a.block));
+
+  // Remove old rings
+  annotationRings.forEach((ring, name) => {
+    if (!annotatedBlocks.has(name)) {
+      group.remove(ring);
+      ring.geometry.dispose();
+      ring.material.dispose();
+      annotationRings.delete(name);
+    }
+  });
+
+  // Add new rings
+  annotatedBlocks.forEach(blockName => {
+    if (annotationRings.has(blockName)) return;
+    const somaMesh = somaMeshes.get(blockName);
+    if (!somaMesh) return;
+
+    const block = blocks.find(b => b.name === blockName);
+    const baseR = (R[block?.level] || R[2]) * 3.0;
+    const ringGeo = new THREE.TorusGeometry(baseR * 1.4, 0.02, 8, 24);
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: 0xe8bd73,
+      transparent: true,
+      opacity: 0.5,
+    });
+    const ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.position.copy(somaMesh.position);
+    ring.rotation.x = Math.PI / 2;
+    annotationRings.set(blockName, ring);
+    group.add(ring);
+  });
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Phase 4: Annotation Modal + Detail Annotations
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const annModalOverlay = document.getElementById('annotation-modal-overlay');
+const annModalNote = document.getElementById('ann-modal-note');
+const annModalContext = document.getElementById('ann-modal-context');
+const annModalTags = document.getElementById('ann-modal-tags');
+
+// Capture context at modal open time to prevent drift during replay
+let annModalOpenContext = { block: null, timestep: null, profile: null };
+
+function openAnnotationModal() {
+  if (!selectedBlockName) return;
+
+  annModalOpenContext = {
+    block: selectedBlockName,
+    timestep: currentTimestep || '?',
+    profile: currentProfileKey || '?',
+  };
+
+  annModalContext.textContent =
+    `${annModalOpenContext.block} \u00b7 step ${annModalOpenContext.timestep} \u00b7 ${annModalOpenContext.profile}`;
+  annModalNote.value = '';
+  annModalTags.querySelectorAll('.ann-tag-chip').forEach(c => c.classList.remove('selected'));
+  annModalOverlay.style.display = 'flex';
+  annModalNote.focus();
+}
+
+function closeAnnotationModal() {
+  annModalOverlay.style.display = 'none';
+}
+
+function saveAnnotationFromModal() {
+  const note = annModalNote.value.trim();
+  if (!note) return;
+
+  const tags = Array.from(annModalTags.querySelectorAll('.ann-tag-chip.selected'))
+    .map(c => c.dataset.tag);
+
+  addAnnotation(
+    annModalOpenContext.block,
+    annModalOpenContext.timestep,
+    annModalOpenContext.profile,
+    note,
+    tags
+  );
+
+  closeAnnotationModal();
+  updateDetailAnnotations();
+  updateAnnotationListPanel();
+}
+
+// Tag chip toggle
+annModalTags.querySelectorAll('.ann-tag-chip').forEach(chip => {
+  chip.addEventListener('click', () => chip.classList.toggle('selected'));
+});
+
+document.getElementById('ann-modal-save').addEventListener('click', saveAnnotationFromModal);
+document.getElementById('ann-modal-cancel').addEventListener('click', closeAnnotationModal);
+document.getElementById('ann-modal-close').addEventListener('click', closeAnnotationModal);
+document.getElementById('add-annotation-btn').addEventListener('click', openAnnotationModal);
+
+// Escape closes modal
+annModalOverlay.addEventListener('click', (e) => {
+  if (e.target === annModalOverlay) closeAnnotationModal();
+});
+
+function updateDetailAnnotations() {
+  if (!selectedBlockName) return;
+  const listEl = document.getElementById('detail-ann-list');
+  const anns = getBlockAnnotations(selectedBlockName);
+
+  if (anns.length === 0) {
+    listEl.innerHTML = '';
+    return;
+  }
+
+  listEl.innerHTML = anns.map(a => `
+    <div class="annotation-item" data-id="${escapeHtml(a.id)}">
+      <span class="ann-delete" data-id="${escapeHtml(a.id)}">&times;</span>
+      <div>${escapeHtml(a.note)}</div>
+      ${a.tags?.length ? `<div class="ann-tags">${a.tags.map(t => `<span class="ann-tag">${escapeHtml(t)}</span>`).join('')}</div>` : ''}
+      <div style="font-size:7px;color:rgba(0,0,0,0.2);margin-top:2px;">step ${escapeHtml(String(a.timestep))} \u00b7 ${escapeHtml(a.profile)}</div>
+    </div>
+  `).join('');
+
+  // Delete handlers
+  listEl.querySelectorAll('.ann-delete').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteAnnotation(btn.dataset.id);
+      updateDetailAnnotations();
+      updateAnnotationListPanel();
+    });
+  });
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Phase 4: Annotation List Panel (global view)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const annListPanel = document.getElementById('annotation-list-panel');
+const annListToggle = document.getElementById('annotation-list-toggle');
+
+annListToggle.addEventListener('click', () => {
+  const visible = annListPanel.style.display !== 'none';
+  annListPanel.style.display = visible ? 'none' : 'block';
+  if (!visible) updateAnnotationListPanel();
+});
+
+function updateAnnotationListPanel() {
+  const content = document.getElementById('annotation-list-content');
+  const anns = loadAnnotations();
+
+  if (anns.length === 0) {
+    content.innerHTML = '<div class="ann-list-empty">No annotations yet. Click a block to start.</div>';
+    return;
+  }
+
+  // Sort by creation date (newest first)
+  const sorted = [...anns].sort((a, b) => b.created.localeCompare(a.created));
+
+  content.innerHTML = sorted.map(a => `
+    <div class="annotation-item" data-block="${escapeHtml(a.block)}" data-id="${escapeHtml(a.id)}">
+      <span class="ann-delete" data-id="${escapeHtml(a.id)}">&times;</span>
+      <div style="font-size:7px;color:rgba(0,0,0,0.5);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:2px;">${escapeHtml(a.block)}</div>
+      <div>${escapeHtml(a.note)}</div>
+      ${a.tags?.length ? `<div class="ann-tags">${a.tags.map(t => `<span class="ann-tag">${escapeHtml(t)}</span>`).join('')}</div>` : ''}
+      <div style="font-size:7px;color:rgba(0,0,0,0.2);margin-top:2px;">step ${escapeHtml(String(a.timestep))} \u00b7 ${escapeHtml(a.profile)}</div>
+    </div>
+  `).join('');
+
+  // Click to select block
+  content.querySelectorAll('.annotation-item').forEach(item => {
+    item.addEventListener('click', (e) => {
+      if (e.target.classList.contains('ann-delete')) return;
+      const blockName = item.dataset.block;
+      if (blockName && somaMeshes.has(blockName)) {
+        selectBlock(blockName);
+      }
+    });
+  });
+
+  // Delete handlers
+  content.querySelectorAll('.ann-delete').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteAnnotation(btn.dataset.id);
+      updateAnnotationListPanel();
+      if (selectedBlockName) updateDetailAnnotations();
+    });
+  });
+}
+
+// Prevent UI events from reaching OrbitControls
+['pointerdown', 'wheel'].forEach(evt => {
+  document.getElementById('block-detail-panel').addEventListener(evt, e => e.stopPropagation());
+  annModalOverlay.addEventListener(evt, e => e.stopPropagation());
+  annListPanel.addEventListener(evt, e => e.stopPropagation());
+  annListToggle.addEventListener(evt, e => e.stopPropagation());
+});
+
+// Detail panel close
+document.getElementById('detail-close').addEventListener('click', deselectBlock);
+
+// Initialize annotation markers + count
+updateAnnotationMarkers();
+updateAnnotationCount();
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Phase 5 — Intervention Queue + Comparison Mode
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ── Intervention Queue ──
+
+const interventionQueue = [];
+
+const interventionOpSelect = document.getElementById('intervention-op');
+const interventionMagRow = document.getElementById('intervention-mag-row');
+const interventionMag = document.getElementById('intervention-mag');
+const interventionChannels = document.getElementById('intervention-channels');
+const interventionSteps = document.getElementById('intervention-steps');
+const addInterventionBtn = document.getElementById('add-intervention-btn');
+const iqToggle = document.getElementById('iq-toggle');
+const iqPanel = document.getElementById('intervention-queue-panel');
+const iqList = document.getElementById('iq-list');
+const iqClose = document.getElementById('iq-close');
+const iqCopy = document.getElementById('iq-copy');
+const iqClear = document.getElementById('iq-clear');
+
+// Show/hide magnitude row based on operation
+interventionOpSelect.addEventListener('change', () => {
+  const op = interventionOpSelect.value;
+  interventionMagRow.style.display = (op === 'amplify' || op === 'clamp') ? 'flex' : 'none';
+});
+
+// Update channel group options when block is selected
+function updateInterventionChannels() {
+  const block = blocks.find(b => b.name === selectedBlockName);
+  if (!block) return;
+  const ch = block.ch;
+  const groupSize = 32;
+  const groups = Math.ceil(ch / groupSize);
+
+  interventionChannels.innerHTML = '<option value="all">All</option>';
+  for (let g = 0; g < groups; g++) {
+    const start = g * groupSize;
+    const end = Math.min(start + groupSize, ch) - 1;
+    const opt = document.createElement('option');
+    opt.value = `${start}-${end}`;
+    opt.textContent = `ch ${start}-${end}`;
+    interventionChannels.appendChild(opt);
+  }
+}
+
+function resolveTimesteps() {
+  const val = interventionSteps.value;
+  if (val === 'all') return ['all'];
+  if (val === 'current') return [parseInt(currentTimestep)];
+  if (val === 'early') return Array.from({length: 7}, (_, i) => i + 1);
+  if (val === 'late') return Array.from({length: 10}, (_, i) => i + 20);
+  return ['all'];
+}
+
+function resolveChannels() {
+  const val = interventionChannels.value;
+  if (val === 'all') return 'all';
+  const [start, end] = val.split('-').map(Number);
+  return Array.from({length: end - start + 1}, (_, i) => start + i);
+}
+
+addInterventionBtn.addEventListener('click', () => {
+  if (!selectedBlockName) return;
+
+  const profileName = vizToProfileName(selectedBlockName) || selectedBlockName;
+  const intervention = {
+    block_name: profileName,
+    channels: resolveChannels(),
+    operation: interventionOpSelect.value,
+    magnitude: parseFloat(interventionMag.value) || 0,
+    timesteps: resolveTimesteps(),
+  };
+
+  interventionQueue.push(intervention);
+  updateInterventionQueueUI();
+});
+
+function updateInterventionQueueUI() {
+  const count = interventionQueue.length;
+  iqToggle.textContent = `Interventions (${count})`;
+  iqToggle.style.display = count > 0 ? 'block' : 'none';
+
+  iqList.innerHTML = interventionQueue.map((iv, i) => {
+    const chLabel = iv.channels === 'all' ? 'all ch' : `ch ${iv.channels[0]}-${iv.channels[iv.channels.length - 1]}`;
+    const tsLabel = iv.timesteps[0] === 'all' ? 'all steps' : `steps ${iv.timesteps.join(',')}`;
+    const magLabel = (iv.operation === 'amplify' || iv.operation === 'clamp') ? ` ×${iv.magnitude}` : '';
+    return `<div class="iq-item">
+      <span>${iv.block_name} · ${iv.operation}${magLabel} · ${chLabel} · ${tsLabel}</span>
+      <span class="iq-remove" data-idx="${i}">&times;</span>
+    </div>`;
+  }).join('');
+
+  iqList.querySelectorAll('.iq-remove').forEach(btn => {
+    btn.addEventListener('click', () => {
+      interventionQueue.splice(parseInt(btn.dataset.idx), 1);
+      updateInterventionQueueUI();
+    });
+  });
+}
+
+iqToggle.addEventListener('click', () => {
+  iqPanel.style.display = iqPanel.style.display === 'none' ? 'block' : 'none';
+});
+iqClose.addEventListener('click', () => { iqPanel.style.display = 'none'; });
+
+iqCopy.addEventListener('click', () => {
+  const config = {
+    description: `Intervention config from UNet Visualizer`,
+    profile: currentProfileKey,
+    interventions: interventionQueue.map(iv => ({...iv})),
+  };
+  const json = JSON.stringify(config, null, 2);
+  navigator.clipboard.writeText(json).then(() => {
+    iqCopy.textContent = 'Copied!';
+    setTimeout(() => { iqCopy.textContent = 'Copy Config'; }, 1500);
+  }).catch(() => {
+    // Fallback: select text in a temporary textarea
+    const ta = document.createElement('textarea');
+    ta.value = json;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+    iqCopy.textContent = 'Copied!';
+    setTimeout(() => { iqCopy.textContent = 'Copy Config'; }, 1500);
+  });
+});
+
+iqClear.addEventListener('click', () => {
+  interventionQueue.length = 0;
+  updateInterventionQueueUI();
+  iqPanel.style.display = 'none';
+});
+
+// Prevent UI events from reaching OrbitControls
+['pointerdown', 'wheel'].forEach(evt => {
+  iqPanel.addEventListener(evt, e => e.stopPropagation());
+  iqToggle.addEventListener(evt, e => e.stopPropagation());
+});
+
+// ── CFG View Mode ──
+
+const CFG_MODES = ['merged', 'cond', 'uncond', 'delta'];
+const CFG_LABELS = { merged: 'Merged', cond: 'Cond', uncond: 'Uncond', delta: 'Delta' };
+let cfgViewMode = 'merged';
+const cfgToggle = document.getElementById('cfg-toggle');
+
+cfgToggle.addEventListener('click', () => {
+  const idx = CFG_MODES.indexOf(cfgViewMode);
+  cfgViewMode = CFG_MODES[(idx + 1) % CFG_MODES.length];
+  cfgToggle.textContent = `CFG: ${CFG_LABELS[cfgViewMode]}`;
+  cfgToggle.classList.toggle('active', cfgViewMode !== 'merged');
+  updateBlockColors();
+  updateUI();
+});
+
+// Show CFG toggle only when v2 data with cfg_split is available
+function updateCfgToggleVisibility() {
+  const hasCfg = currentVizData?.cfg_split && Object.keys(currentVizData.cfg_split).length > 0;
+  cfgToggle.style.display = hasCfg ? 'block' : 'none';
+  if (!hasCfg && cfgViewMode !== 'merged') {
+    cfgViewMode = 'merged';
+    cfgToggle.textContent = 'CFG: Merged';
+    cfgToggle.classList.remove('active');
+  }
+}
+
+// Prevent UI events from reaching OrbitControls
+['pointerdown', 'wheel'].forEach(evt => {
+  cfgToggle.addEventListener(evt, e => e.stopPropagation());
+});
+
+// ── Comparison Mode ──
+
+let compareActive = false;
+let compareVizDataB = null;
+let compareProfileKeyB = null;
+
+const compareToggle = document.getElementById('compare-toggle');
+const comparePanel = document.getElementById('compare-panel');
+const compareA = document.getElementById('compare-a');
+const compareB = document.getElementById('compare-b');
+const compareMode = document.getElementById('compare-mode');
+const compareLoad = document.getElementById('compare-load');
+const compareExit = document.getElementById('compare-exit');
+
+// Populate comparison selects when profiles are loaded
+function populateCompareSelects() {
+  if (!vizIndex) return;
+  [compareA, compareB].forEach(sel => {
+    sel.innerHTML = '';
+    vizIndex.profiles.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.key;
+      opt.textContent = `${p.character} / ${p.pose}`;
+      sel.appendChild(opt);
+    });
+  });
+  // Default: A = current profile, B = different one
+  compareA.value = currentProfileKey;
+  const other = vizIndex.profiles.find(p => p.key !== currentProfileKey);
+  if (other) compareB.value = other.key;
+}
+
+compareToggle.addEventListener('click', () => {
+  if (comparePanel.style.display === 'none') {
+    populateCompareSelects();
+    comparePanel.style.display = 'block';
+    compareToggle.classList.add('active');
+  } else {
+    comparePanel.style.display = 'none';
+    compareToggle.classList.remove('active');
+  }
+});
+
+compareLoad.addEventListener('click', async () => {
+  const keyA = compareA.value;
+  const keyB = compareB.value;
+
+  if (keyA === keyB) return;
+
+  // Load profile A (use current if matching)
+  if (currentProfileKey !== keyA) {
+    document.getElementById('profile-select').value = keyA;
+    document.getElementById('profile-select').dispatchEvent(new Event('change'));
+  }
+
+  // Load profile B — use viz_json from index if available
+  try {
+    const profileB = vizIndex.profiles.find(p => p.key === keyB);
+    const vizPath = profileB?.viz_json || `activation-mapping/profiles/viz/${keyB}.viz.json`;
+    const stripBase = (path) => DATA_BASE + path.replace(/^activation-mapping\//, '');
+    const resp = await fetch(stripBase(vizPath));
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    compareVizDataB = await resp.json();
+    compareProfileKeyB = keyB;
+    compareActive = true;
+
+    // Show exit button, hide load
+    compareLoad.style.display = 'none';
+    compareExit.style.display = 'block';
+
+    // Add second image panel for profile B
+    addCompareImageB();
+
+    // Update block colors to show difference
+    updateCompareColors();
+  } catch (e) {
+    console.warn('Failed to load comparison profile:', e);
+  }
+});
+
+compareExit.addEventListener('click', () => {
+  compareActive = false;
+  compareVizDataB = null;
+  compareProfileKeyB = null;
+
+  // Remove comparison image + label
+  const imgB = document.getElementById('compare-image-b');
+  if (imgB) imgB.remove();
+  const labelB = document.getElementById('compare-image-b-label');
+  if (labelB) labelB.remove();
+
+  // Restore normal colors
+  updateBlockColors();
+
+  compareLoad.style.display = 'block';
+  compareExit.style.display = 'none';
+  comparePanel.style.display = 'none';
+  compareToggle.classList.remove('active');
+});
+
+function addCompareImageB() {
+  // Remove existing image + label
+  let imgB = document.getElementById('compare-image-b');
+  if (imgB) imgB.remove();
+  let oldLabel = document.getElementById('compare-image-b-label');
+  if (oldLabel) oldLabel.remove();
+
+  if (!vizIndex || !compareProfileKeyB) return;
+
+  const profile = vizIndex.profiles.find(p => p.key === compareProfileKeyB);
+  if (!profile || !profile.has_intermediates) return;
+
+  const stripBase = (path) => path ? DATA_BASE + path.replace(/^activation-mapping\//, '') : null;
+  const rawPath = profile.images?.intermediates?.[currentTimestep];
+  const imgPath = rawPath ? stripBase(rawPath) : null;
+
+  if (imgPath) {
+    imgB = document.createElement('img');
+    imgB.id = 'compare-image-b';
+    imgB.src = imgPath;
+    imgB.style.width = '90px';
+    imgB.style.height = Math.round(90 * 1216 / 832) + 'px';
+    imgB.style.objectFit = 'cover';
+    document.body.appendChild(imgB);
+
+    // Label
+    const label = document.createElement('div');
+    label.id = 'compare-image-b-label';
+    label.style.cssText = 'position:fixed;bottom:10px;right:28px;font-family:"DM Mono",monospace;font-size:7px;color:rgba(0,0,0,0.4);z-index:16;pointer-events:none;text-align:center;width:90px;';
+    label.textContent = `${profile.character} / ${profile.pose}`;
+    document.body.appendChild(label);
+  }
+}
+
+function updateCompareImageB() {
+  const imgB = document.getElementById('compare-image-b');
+  if (!imgB || !vizIndex || !compareProfileKeyB) return;
+
+  const profile = vizIndex.profiles.find(p => p.key === compareProfileKeyB);
+  if (!profile) return;
+
+  const stripBase = (path) => path ? DATA_BASE + path.replace(/^activation-mapping\//, '') : null;
+  const rawPath = profile.images?.intermediates?.[currentTimestep];
+  if (rawPath) imgB.src = stripBase(rawPath);
+}
+
+function updateCompareColors() {
+  if (!compareActive || !currentVizData || !compareVizDataB) return;
+
+  const mode = compareMode.value;
+  const blockDataA = currentVizData.blocks?.[currentTimestep];
+  const blockDataB = compareVizDataB.blocks?.[currentTimestep];
+
+  if (!blockDataA || !blockDataB) {
+    // Reset to neutral grey when data is missing for this timestep
+    const neutralColor = new THREE.Color(0x808080);
+    somaMeshes.forEach((mesh) => {
+      mesh.material.color.copy(neutralColor);
+      mesh.material.emissive.setHex(0x000000);
+    });
+    return;
+  }
+
+  // Collect differences
+  const diffs = new Map();
+  let maxAbsDiff = 0;
+
+  somaMeshes.forEach((mesh, vizName) => {
+    const profileName = vizToProfileName(vizName);
+    if (!profileName) return;
+
+    const a = blockDataA[profileName];
+    const b = blockDataB[profileName];
+    if (!a || !b) return;
+
+    const logA = a.log_norm ?? Math.log1p(a.norm ?? 0);
+    const logB = b.log_norm ?? Math.log1p(b.norm ?? 0);
+    const diff = logA - logB;
+    diffs.set(vizName, diff);
+    maxAbsDiff = Math.max(maxAbsDiff, Math.abs(diff));
+  });
+
+  if (maxAbsDiff === 0) maxAbsDiff = 1;
+
+  // Color: blue (B stronger) → neutral → red (A stronger)
+  const coldColor = new THREE.Color(0x4080c0); // blue
+  const neutralColor = new THREE.Color(0x808080); // grey
+  const hotColor = new THREE.Color(0xc04040); // red
+
+  somaMeshes.forEach((mesh, vizName) => {
+    const diff = diffs.get(vizName);
+    if (diff == null) {
+      mesh.material.color.set(0x505868);
+      mesh.material.emissive.setScalar(0);
+      return;
+    }
+
+    const t = diff / maxAbsDiff; // -1 to 1
+    const color = new THREE.Color();
+    if (t >= 0) {
+      color.lerpColors(neutralColor, hotColor, t);
+    } else {
+      color.lerpColors(neutralColor, coldColor, -t);
+    }
+    mesh.material.color.copy(color);
+    mesh.material.emissive.copy(color).multiplyScalar(Math.abs(t) * 0.3);
+  });
+}
+
+// Prevent compare panel events from reaching OrbitControls
+['pointerdown', 'wheel'].forEach(evt => {
+  comparePanel.addEventListener(evt, e => e.stopPropagation());
+  compareToggle.addEventListener(evt, e => e.stopPropagation());
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Animation — breathing + skip emission pulse + signal flow
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function animate() {
+  requestAnimationFrame(animate);
+  const t = performance.now() / 1000;
+
+  // Breathing: slow Y-scale oscillation
+  group.scale.y = 1.0 + Math.sin(t * 2 * Math.PI / 10) * 0.005;
+
+  // Skip emission pulse: decorative sine only when replay is NOT active
+  // (when replay is active, applySignalPulse handles skip lighting)
+  if (activeBlockIndex < 0) {
+    skipMats.forEach((mat, i) => {
+      const phase = (i / skipMats.length) * Math.PI * 2;
+      mat.emissiveIntensity = 0.15 + 0.10 * Math.sin(t * 2 * Math.PI / 4 + phase);
+    });
+  }
+
+  // Auto-advance play (BEFORE signal pulse so pulse uses current-frame state, not stale)
+  advancePlay(t);
+
+  // Signal pulse + trail when replay is active
+  if (activeBlockIndex >= 0) {
+    applySignalPulse(t);
+  }
+
+  // Camera animation (block expansion zoom)
+  updateCameraAnimation(performance.now());
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+</script>
+</body>
+</html>
