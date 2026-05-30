@@ -1784,7 +1784,7 @@ uiStyle.textContent = `
     white-space: nowrap;
   }
 
-  /* Phase 4: Block Detail Panel */
+  /* Block Detail Panel */
   #block-detail-panel {
     position: fixed; top: 80px; right: 28px;
     width: 260px;
@@ -2079,7 +2079,7 @@ uiStyle.textContent = `
     padding: 20px 0;
   }
 
-  /* Phase 5 — Intervention builder */
+  /* Intervention builder */
   #detail-intervention-section {
     border-top: 1px solid rgba(0,0,0,0.06);
     padding-top: 8px;
@@ -3163,7 +3163,7 @@ function advancePlay(t) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Phase 4: Raycaster + Block Selection + Click Detection
+// Raycaster + Block Selection + Click Detection
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 const raycaster = new THREE.Raycaster();
@@ -3212,7 +3212,7 @@ function handleSceneClick(event) {
 // Expose raycaster + click internals for debug
 window._vizDebug.raycaster = raycaster;
 window._vizDebug.meshToBlock = meshToBlock;
-// Phase 5 will add: interventionQueue, compareActive via late binding
+// interventionQueue and compareActive are bound later (defined further down).
 
 function selectBlock(blockName) {
   selectedBlockName = blockName;
@@ -3235,7 +3235,7 @@ function deselectBlock() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Phase 4: Block Detail Panel
+// Block Detail Panel
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 function updateDetailPanel() {
@@ -3327,7 +3327,7 @@ function updateDetailPanel() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Phase 4: Channel Group Display (Progressive Disclosure)
+// Channel Group Display (Progressive Disclosure)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 const fullProfileCache = new Map(); // profileKey → full profile data
@@ -3803,7 +3803,7 @@ function updatePcaBrainScan() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Phase 4: Annotation Store (localStorage)
+// Annotation Store (localStorage)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 const ANNOTATION_KEY = 'unet-viz-annotations';
@@ -3864,7 +3864,7 @@ function updateAnnotationCount() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Phase 4: Annotation Markers (3D indicators on annotated blocks)
+// Annotation Markers (3D indicators on annotated blocks)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 const annotationRings = new Map(); // blockName → ring mesh
@@ -3906,7 +3906,7 @@ function updateAnnotationMarkers() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Phase 4: Annotation Modal + Detail Annotations
+// Annotation Modal + Detail Annotations
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 const annModalOverlay = document.getElementById('annotation-modal-overlay');
@@ -4004,7 +4004,7 @@ function updateDetailAnnotations() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Phase 4: Annotation List Panel (global view)
+// Annotation List Panel (global view)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 const annListPanel = document.getElementById('annotation-list-panel');
@@ -4076,7 +4076,7 @@ updateAnnotationMarkers();
 updateAnnotationCount();
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Phase 5 — Intervention Queue + Comparison Mode
+// Intervention Queue + Comparison Mode
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 // ── Intervention Queue ──
